@@ -56,6 +56,12 @@ pub trait IConversationRepository: Send + Sync {
     /// The conversation identified by `conversation_id` is excluded.
     async fn list_associated(&self, user_id: &str, conversation_id: &str) -> Result<Vec<ConversationRow>, DbError>;
 
+    /// Returns whether `workspace` is assigned to at least one conversation
+    /// owned by `user_id`. Used by host file APIs to enforce tenant boundaries.
+    async fn owns_workspace(&self, _user_id: &str, _workspace: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,

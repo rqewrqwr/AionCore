@@ -442,6 +442,7 @@ mod tests {
     fn make_test_row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
         McpServerRow {
             id: "mcp_123".into(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: "test-server".into(),
             description: Some("A test server".into()),
             enabled: true,

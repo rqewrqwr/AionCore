@@ -204,6 +204,22 @@ List available skills:
 "$AIONUI_HELPER_BIN" config skills list
 ```
 
+Create and import a basic skill directly from the conversation:
+
+```bash
+"$AIONUI_HELPER_BIN" config skills create <<'JSON'
+{
+  "name": "requirements-review",
+  "description": "Review product requirements for ambiguity and missing acceptance criteria",
+  "instructions": "Review the supplied requirements. Identify ambiguity, missing edge cases, dependencies, and measurable acceptance criteria. Return a prioritized checklist."
+}
+JSON
+```
+
+Use a portable name containing only letters, numbers, `-`, or `_`. For a
+larger skill with scripts or reference files, use `skill-creator` to scaffold
+the directory, then import it with the command below.
+
 Inspect a skill directory before importing:
 
 ```bash

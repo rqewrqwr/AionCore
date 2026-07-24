@@ -64,6 +64,19 @@ pub trait IAssistantDefinitionRepository: Send + Sync {
         self.list().await
     }
     async fn get_by_assistant_id(&self, assistant_id: &str) -> Result<Option<AssistantDefinitionRow>, DbError>;
+    /// Look up an assistant visible to `user_id`.
+    ///
+    /// System definitions are shared. User definitions fail closed unless the
+    /// concrete repository can prove ownership. The legacy desktop principal
+    /// remains trusted for single-user/local mode compatibility.
+    async fn get_by_assistant_id_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        let row = self.get_by_assistant_id(assistant_id).await?;
+        Ok(row.filter(|row| user_id == crate::DEFAULT_RESOURCE_OWNER || row.owner_type.eq_ignore_ascii_case("system")))
+    }
     async fn get_by_assistant_id_including_deleted(
         &self,
         assistant_id: &str,

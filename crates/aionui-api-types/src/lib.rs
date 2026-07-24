@@ -29,6 +29,7 @@ mod system;
 mod team;
 mod team_mcp;
 mod websocket;
+mod workspace;
 
 pub use acp::{
     AcpConfigOptionDto, AcpConfigSelectOptionDto, AcpEnvResponse, AgentModeResponse, ConfigOptionConfirmation,
@@ -167,6 +168,7 @@ pub use team::{
 };
 pub use team_mcp::{TEAM_MCP_SERVER_NAME, TeamMcpStdioConfig};
 pub use websocket::WebSocketMessage;
+pub use workspace::{CreateWorkspaceRequest, WorkspaceListResponse, WorkspaceResponse};
 
 #[cfg(test)]
 mod public_contract_tests {

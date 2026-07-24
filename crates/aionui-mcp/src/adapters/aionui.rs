@@ -150,6 +150,7 @@ mod tests {
     fn make_row(name: &str, transport_type: &str, transport_config: &str) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled: true,

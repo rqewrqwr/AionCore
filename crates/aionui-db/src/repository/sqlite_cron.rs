@@ -24,16 +24,17 @@ impl ICronRepository for SqliteCronRepository {
     async fn insert(&self, row: &CronJobRow) -> Result<(), DbError> {
         sqlx::query(
             "INSERT INTO cron_jobs (\
-                id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
+                id, owner_user_id, name, enabled, schedule_kind, schedule_value, schedule_tz, \
                 schedule_description, payload_message, execution_mode, agent_config, \
                 conversation_id, conversation_title, created_by, \
                 skill_content, description, created_at, updated_at, next_run_at, last_run_at, \
                 last_status, last_error, run_count, retry_count, max_retries, queue_enabled\
             ) VALUES (\
-                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
+                ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?\
             )",
         )
         .bind(&row.id)
+        .bind(&row.owner_user_id)
         .bind(&row.name)
         .bind(row.enabled)
         .bind(&row.schedule_kind)
@@ -172,10 +173,28 @@ impl ICronRepository for SqliteCronRepository {
         Ok(row)
     }
 
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError> {
+        let row = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE id = ? AND owner_user_id = ?")
+            .bind(id)
+            .bind(user_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
     async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError> {
         let rows = sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs ORDER BY created_at ASC")
             .fetch_all(&self.pool)
             .await?;
+        Ok(rows)
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError> {
+        let rows =
+            sqlx::query_as::<_, CronJobRow>("SELECT * FROM cron_jobs WHERE owner_user_id = ? ORDER BY created_at ASC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -194,6 +213,33 @@ impl ICronRepository for SqliteCronRepository {
         .fetch_all(&self.pool)
         .await?;
         Ok(rows)
+    }
+
+    async fn list_by_conversation_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJobRow>, DbError> {
+        let rows = sqlx::query_as::<_, CronJobRow>(
+            "SELECT * FROM cron_jobs WHERE conversation_id = ? AND owner_user_id = ? ORDER BY created_at ASC",
+        )
+        .bind(conversation_id)
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM cron_jobs WHERE id = ? AND owner_user_id = ?")
+            .bind(id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("cron job '{id}'")));
+        }
+        Ok(())
     }
 
     async fn delete_by_conversation(&self, conversation_id: &str) -> Result<u64, DbError> {
@@ -445,6 +491,7 @@ mod tests {
         let now = now_ms();
         CronJobRow {
             id: id.into(),
+            owner_user_id: "user_1".into(),
             name: "Test Job".into(),
             enabled: true,
             schedule_kind: "every".into(),
@@ -484,6 +531,31 @@ mod tests {
         assert!(found.enabled);
         assert_eq!(found.schedule_kind, "every");
         assert_eq!(found.run_count, 0);
+    }
+
+    #[tokio::test]
+    async fn user_scoped_cron_access_denies_other_users() {
+        let (repo, _db) = setup().await;
+        repo.insert(&make_row("cron_private")).await.unwrap();
+
+        assert!(
+            repo.get_by_id_for_user("user_1", "cron_private")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            repo.get_by_id_for_user("user_2", "cron_private")
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(repo.list_for_user("user_1").await.unwrap().len(), 1);
+        assert!(repo.list_for_user("user_2").await.unwrap().is_empty());
+        assert!(matches!(
+            repo.delete_for_user("user_2", "cron_private").await,
+            Err(DbError::NotFound(_))
+        ));
     }
 
     #[tokio::test]

@@ -7,7 +7,7 @@ use aionui_api_types::{
 };
 use aionui_common::{RemoteAgentAuthType, RemoteAgentProtocol, RemoteAgentStatus, decrypt_string, encrypt_string};
 use aionui_db::models::RemoteAgentRow;
-use aionui_db::{IRemoteAgentRepository, UpdateRemoteAgentParams};
+use aionui_db::{DEFAULT_RESOURCE_OWNER, IRemoteAgentRepository, UpdateRemoteAgentParams};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::SigningKey;
@@ -30,15 +30,23 @@ impl RemoteAgentService {
 
     /// List all remote agents (auth_token omitted).
     pub async fn list(&self) -> Result<Vec<RemoteAgentListItem>, AgentError> {
-        let rows = self.repo.list().await.map_err(db_err)?;
+        self.list_for_user(DEFAULT_RESOURCE_OWNER).await
+    }
+
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<RemoteAgentListItem>, AgentError> {
+        let rows = self.repo.list_for_user(user_id).await.map_err(db_err)?;
         rows.into_iter().map(|r| self.row_to_list_item(r)).collect()
     }
 
     /// Get a single remote agent by ID (auth_token masked).
     pub async fn get(&self, id: &str) -> Result<RemoteAgentResponse, AgentError> {
+        self.get_for_user(DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn get_for_user(&self, user_id: &str, id: &str) -> Result<RemoteAgentResponse, AgentError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await
             .map_err(db_err)?
             .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
@@ -47,6 +55,14 @@ impl RemoteAgentService {
 
     /// Create a new remote agent. OpenClaw protocol auto-generates Ed25519 keys.
     pub async fn create(&self, req: CreateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
+        self.create_for_user(DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn create_for_user(
+        &self,
+        user_id: &str,
+        req: CreateRemoteAgentRequest,
+    ) -> Result<RemoteAgentResponse, AgentError> {
         validate_create_request(&req)?;
 
         let encrypted_token = req
@@ -81,11 +97,23 @@ impl RemoteAgentService {
             .await
             .map_err(db_err)?;
 
+        self.repo.assign_to_user(user_id, &row.id).await.map_err(db_err)?;
+
         self.row_to_response(row)
     }
 
     /// Update an existing remote agent.
     pub async fn update(&self, id: &str, req: UpdateRemoteAgentRequest) -> Result<RemoteAgentResponse, AgentError> {
+        self.update_for_user(DEFAULT_RESOURCE_OWNER, id, req).await
+    }
+
+    pub async fn update_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateRemoteAgentRequest,
+    ) -> Result<RemoteAgentResponse, AgentError> {
+        self.ensure_access(user_id, id).await?;
         let encrypted_token = match &req.auth_token {
             Some(Some(t)) => Some(Some(
                 encrypt_string(t, &self.encryption_key).map_err(|e| AgentError::internal(e.to_string()))?,
@@ -118,6 +146,11 @@ impl RemoteAgentService {
 
     /// Delete a remote agent.
     pub async fn delete(&self, id: &str) -> Result<(), AgentError> {
+        self.delete_for_user(DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
+        self.ensure_access(user_id, id).await?;
         self.repo.delete(id).await.map_err(|e| match e {
             aionui_db::DbError::NotFound(msg) => AgentError::not_found(msg),
             other => AgentError::internal(other.to_string()),
@@ -149,9 +182,13 @@ impl RemoteAgentService {
 
     /// OpenClaw device handshake (15s timeout).
     pub async fn handshake(&self, id: &str) -> Result<HandshakeResponse, AgentError> {
+        self.handshake_for_user(DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn handshake_for_user(&self, user_id: &str, id: &str) -> Result<HandshakeResponse, AgentError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await
             .map_err(db_err)?
             .ok_or_else(|| AgentError::not_found(format!("Remote agent '{id}' not found")))?;
@@ -249,6 +286,19 @@ impl RemoteAgentService {
             created_at: row.created_at,
             updated_at: row.updated_at,
         })
+    }
+
+    async fn ensure_access(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
+        if self
+            .repo
+            .find_by_id_for_user(user_id, id)
+            .await
+            .map_err(db_err)?
+            .is_none()
+        {
+            return Err(AgentError::not_found(format!("Remote agent '{id}' not found")));
+        }
+        Ok(())
     }
 }
 

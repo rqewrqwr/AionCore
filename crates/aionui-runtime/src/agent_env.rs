@@ -47,7 +47,15 @@ fn build_agent_process_env(
 }
 
 fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
-    for key in ["NODE_OPTIONS", "NODE_INSPECT", "NODE_DEBUG", "CLAUDECODE"] {
+    for key in [
+        "NODE_OPTIONS",
+        "NODE_INSPECT",
+        "NODE_DEBUG",
+        "CLAUDECODE",
+        "AIONUI_PRIVATE_GATEWAY_SECRET",
+        "ZIGO_N8N_EXTERNAL_AUTH_SECRET",
+        "N8N_EXTERNAL_AUTH_SECRET",
+    ] {
         remove_env_key(env, key);
     }
     env.retain(|key, _| !env_key_starts_with(key, "npm_"));
@@ -201,9 +209,54 @@ fn is_valid_env_key(key: &str) -> bool {
 mod tests {
     use super::*;
     use std::ffi::OsStr;
+    #[cfg(unix)]
     use std::path::Path;
 
+    #[cfg(unix)]
     const CHILD_MARKER: &str = "AIONUI_RUNTIME_AGENT_ENV_TEST_CHILD";
+
+    #[test]
+    fn private_gateway_secret_is_removed_from_agent_environment() {
+        let mut env = BTreeMap::from([
+            (
+                OsString::from("AIONUI_PRIVATE_GATEWAY_SECRET"),
+                OsString::from("secret"),
+            ),
+            (OsString::from("AIONUI_RUNTIME_TOKEN"), OsString::from("runtime-token")),
+        ]);
+
+        clean_agent_env(&mut env);
+
+        assert!(!env.contains_key(OsStr::new("AIONUI_PRIVATE_GATEWAY_SECRET")));
+        assert_eq!(
+            env.get(OsStr::new("AIONUI_RUNTIME_TOKEN")),
+            Some(&OsString::from("runtime-token"))
+        );
+    }
+
+    #[test]
+    fn n8n_external_auth_secrets_are_removed_from_agent_environment() {
+        let mut env = BTreeMap::from([
+            (
+                OsString::from("ZIGO_N8N_EXTERNAL_AUTH_SECRET"),
+                OsString::from("zigo-secret"),
+            ),
+            (
+                OsString::from("N8N_EXTERNAL_AUTH_SECRET"),
+                OsString::from("legacy-secret"),
+            ),
+            (OsString::from("AIONUI_RUNTIME_TOKEN"), OsString::from("runtime-token")),
+        ]);
+
+        clean_agent_env(&mut env);
+
+        assert!(!env.contains_key(OsStr::new("ZIGO_N8N_EXTERNAL_AUTH_SECRET")));
+        assert!(!env.contains_key(OsStr::new("N8N_EXTERNAL_AUTH_SECRET")));
+        assert_eq!(
+            env.get(OsStr::new("AIONUI_RUNTIME_TOKEN")),
+            Some(&OsString::from("runtime-token"))
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
@@ -235,6 +288,7 @@ printf '%s\n' \
                 .env("AIONUI_OVERLAY", "from-current")
                 .env("NODE_OPTIONS", "--require parent")
                 .env("CLAUDECODE", "1")
+                .env("AIONUI_PRIVATE_GATEWAY_SECRET", "must-not-reach-agent")
                 .env("npm_config_cache", "/tmp/parent-cache")
                 .output()
                 .unwrap();
@@ -259,6 +313,7 @@ printf '%s\n' \
         assert_eq!(value("AIONUI_OVERLAY").as_deref(), Some("from-shell"));
         assert_eq!(value("NODE_OPTIONS"), None);
         assert_eq!(value("CLAUDECODE"), None);
+        assert_eq!(value("AIONUI_PRIVATE_GATEWAY_SECRET"), None);
         assert_eq!(value("npm_config_cache"), None);
         assert_eq!(value("npm_lifecycle_event"), None);
 

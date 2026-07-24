@@ -49,6 +49,7 @@ pub(super) async fn build(
     if let Some(repo) = deps.mcp_server_repo.as_ref() {
         for (name, config) in load_user_mcp_servers(
             repo.as_ref(),
+            &ctx.user_id,
             overrides.mcp_server_ids.as_deref(),
             &ctx.conversation_id,
             deps.broadcaster.clone(),
@@ -78,10 +79,18 @@ pub(super) async fn build(
     let provider_id = &model.provider_id;
     let row = deps
         .provider_repo
-        .find_by_id(provider_id)
+        .find_by_id_for_user(&ctx.user_id, provider_id)
         .await
         .map_err(|e| AgentError::internal(format!("Failed to load provider config: {e}")))?
-        .ok_or_else(|| AgentError::bad_request(format!("Provider '{provider_id}' not found")))?;
+        .ok_or_else(|| {
+            warn!(
+                user_id = %ctx.user_id,
+                provider_id,
+                conversation_id = %ctx.conversation_id,
+                "provider runtime access denied"
+            );
+            AgentError::bad_request(format!("Provider '{provider_id}' not found"))
+        })?;
 
     let api_key = aionui_common::decrypt_string(&row.api_key_encrypted, &deps.encryption_key)
         .map_err(|e| AgentError::internal(e.to_string()))?;
@@ -317,13 +326,14 @@ pub(crate) fn resolve_bedrock_config(json: Option<&str>) -> Option<aion_config::
 
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
+    user_id: &str,
     selected_ids: Option<&[String]>,
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_for_user(user_id, ids).await,
+        None => repo.list_for_user(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -732,6 +742,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -823,8 +834,14 @@ mod tests {
         let repo = MockMcpRepo { rows: vec![row] };
         let selected = vec!["mcp-docs".to_owned()];
 
-        let extra_mcp_servers =
-            load_user_mcp_servers(&repo, Some(&selected), "conv-frozen-mcp", test_broadcaster()).await;
+        let extra_mcp_servers = load_user_mcp_servers(
+            &repo,
+            aionui_db::DEFAULT_RESOURCE_OWNER,
+            Some(&selected),
+            "conv-frozen-mcp",
+            test_broadcaster(),
+        )
+        .await;
 
         assert!(extra_mcp_servers.contains_key("mcp-docs"));
         assert_eq!(extra_mcp_servers["mcp-docs"].transport, TransportType::StreamableHttp);

@@ -135,6 +135,7 @@ fn protected_auth_app(jwt_service: Arc<JwtService>, user_repo: Arc<dyn IUserRepo
         jwt_service,
         user_repo,
         local: false,
+        private_asset_gateway_secret: None,
     };
 
     Router::new()

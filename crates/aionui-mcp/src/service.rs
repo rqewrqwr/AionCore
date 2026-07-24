@@ -39,6 +39,15 @@ impl McpConfigService {
     /// List all MCP servers.
     pub async fn list_servers(&self) -> Result<Vec<McpServerResponse>, McpError> {
         let rows = self.repo.list().await?;
+        Self::rows_to_responses(rows)
+    }
+
+    pub async fn list_servers_for_user(&self, user_id: &str) -> Result<Vec<McpServerResponse>, McpError> {
+        let rows = self.repo.list_for_user(user_id).await?;
+        Self::rows_to_responses(rows)
+    }
+
+    fn rows_to_responses(rows: Vec<aionui_db::models::McpServerRow>) -> Result<Vec<McpServerResponse>, McpError> {
         rows.into_iter()
             .map(|row| McpServer::from_row(row).map(McpServer::into_response))
             .collect()
@@ -46,9 +55,13 @@ impl McpConfigService {
 
     /// Get a single MCP server by ID.
     pub async fn get_server(&self, id: &str) -> Result<McpServerResponse, McpError> {
+        self.get_server_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn get_server_for_user(&self, user_id: &str, id: &str) -> Result<McpServerResponse, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await?
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
         let server = McpServer::from_row(row)?;
@@ -60,13 +73,28 @@ impl McpConfigService {
     /// If a server with the same name already exists, it is updated
     /// (transport, description, original_json) rather than creating a duplicate.
     pub async fn add_server(&self, req: CreateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+        self.add_server_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn add_server_for_user(
+        &self,
+        user_id: &str,
+        req: CreateMcpServerRequest,
+    ) -> Result<McpServerResponse, McpError> {
         let transport = normalize_transport(McpServerTransport::from(req.transport))?;
+        let allow_builtin = user_id == aionui_db::DEFAULT_RESOURCE_OWNER && req.builtin;
+        let owner_user_id = if allow_builtin {
+            aionui_db::SHARED_RESOURCE_OWNER
+        } else {
+            user_id
+        };
         self.upsert_server(
+            owner_user_id,
             &req.name,
             req.description.as_deref(),
             &transport,
             req.original_json.as_deref(),
-            req.builtin,
+            allow_builtin,
             false,
         )
         .await
@@ -74,11 +102,22 @@ impl McpConfigService {
 
     /// Edit an existing MCP server (partial update).
     pub async fn edit_server(&self, id: &str, req: UpdateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+        self.edit_server_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id, req)
+            .await
+    }
+
+    pub async fn edit_server_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateMcpServerRequest,
+    ) -> Result<McpServerResponse, McpError> {
         // Verify the server exists
         let existing_server = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await?
+            .filter(|row| row.owner_user_id == user_id)
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
 
         if let Some(ref new_name) = req.name
@@ -92,7 +131,7 @@ impl McpConfigService {
 
         // Check name uniqueness if renaming
         if let Some(ref new_name) = req.name
-            && let Some(existing) = self.repo.find_by_name_any(new_name).await?
+            && let Some(existing) = self.repo.find_by_name_any_for_user(user_id, new_name).await?
             && existing.id != id
         {
             if existing.builtin {
@@ -121,7 +160,7 @@ impl McpConfigService {
             ..Default::default()
         };
 
-        let row = self.repo.update(id, params).await?;
+        let row = self.repo.update_for_user(user_id, id, params).await?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
@@ -130,13 +169,18 @@ impl McpConfigService {
     ///
     /// Returns whether the deleted server was enabled.
     pub async fn delete_server(&self, id: &str) -> Result<bool, McpError> {
+        self.delete_server_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn delete_server_for_user(&self, user_id: &str, id: &str) -> Result<bool, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await?
+            .filter(|row| row.owner_user_id == user_id)
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
         let was_enabled = row.enabled;
-        self.repo.delete(id).await?;
+        self.repo.delete_for_user(user_id, id).await?;
         Ok(was_enabled)
     }
 
@@ -144,10 +188,15 @@ impl McpConfigService {
     ///
     /// Returns the updated server response.
     pub async fn toggle_server(&self, id: &str) -> Result<McpServerResponse, McpError> {
+        self.toggle_server_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn toggle_server_for_user(&self, user_id: &str, id: &str) -> Result<McpServerResponse, McpError> {
         let row = self
             .repo
-            .find_by_id(id)
+            .find_by_id_for_user(user_id, id)
             .await?
+            .filter(|row| row.owner_user_id == user_id)
             .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
 
         let new_enabled = !row.enabled;
@@ -155,7 +204,7 @@ impl McpConfigService {
             enabled: Some(new_enabled),
             ..Default::default()
         };
-        let updated = self.repo.update(id, params).await?;
+        let updated = self.repo.update_for_user(user_id, id, params).await?;
         let server = McpServer::from_row(updated)?;
         Ok(server.into_response())
     }
@@ -165,11 +214,19 @@ impl McpConfigService {
     /// Each server is processed individually: existing names are updated,
     /// new names are created.
     pub async fn batch_import(&self, req: BatchImportMcpServersRequest) -> Result<Vec<McpServerResponse>, McpError> {
+        self.batch_import_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn batch_import_for_user(
+        &self,
+        user_id: &str,
+        req: BatchImportMcpServersRequest,
+    ) -> Result<Vec<McpServerResponse>, McpError> {
         let requested_count = req.servers.len();
         let mut rows = Vec::with_capacity(requested_count);
         let mut skipped_reserved_count = 0usize;
         for server_req in req.servers {
-            if let Some(existing) = self.repo.find_by_name_any(&server_req.name).await?
+            if let Some(existing) = self.repo.find_by_name_any_for_user(user_id, &server_req.name).await?
                 && existing.builtin
             {
                 skipped_reserved_count += 1;
@@ -181,13 +238,20 @@ impl McpConfigService {
             }
 
             let transport = normalize_transport(McpServerTransport::from(server_req.transport))?;
+            let allow_builtin = user_id == aionui_db::DEFAULT_RESOURCE_OWNER && server_req.builtin;
+            let owner_user_id = if allow_builtin {
+                aionui_db::SHARED_RESOURCE_OWNER
+            } else {
+                user_id
+            };
             let server = self
                 .upsert_server(
+                    owner_user_id,
                     &server_req.name,
                     server_req.description.as_deref(),
                     &transport,
                     server_req.original_json.as_deref(),
-                    server_req.builtin,
+                    allow_builtin,
                     server_req.enabled.unwrap_or(false),
                 )
                 .await?;
@@ -205,6 +269,26 @@ impl McpConfigService {
 
     /// Persist the latest connection test result for an existing MCP server.
     pub async fn persist_test_result(&self, id: &str, result: &McpConnectionTestResult) -> Result<(), McpError> {
+        self.persist_test_result_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id, result)
+            .await
+    }
+
+    pub async fn persist_test_result_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        result: &McpConnectionTestResult,
+    ) -> Result<(), McpError> {
+        let row = self
+            .repo
+            .find_by_id_for_user(user_id, id)
+            .await?
+            .ok_or_else(|| McpError::NotFound(id.to_owned()))?;
+        let can_persist =
+            row.owner_user_id == user_id || (row.owner_user_id == aionui_db::SHARED_RESOURCE_OWNER && row.builtin);
+        if !can_persist {
+            return Err(McpError::NotFound(id.to_owned()));
+        }
         let status = if result.success { "connected" } else { "error" };
         let last_connected = if result.success { Some(now_ms()) } else { None };
         let tools_json = result.tools.as_ref().map(serde_json::to_string).transpose()?;
@@ -214,8 +298,10 @@ impl McpConfigService {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_server(
         &self,
+        owner_user_id: &str,
         name: &str,
         description: Option<&str>,
         transport: &McpServerTransport,
@@ -225,7 +311,7 @@ impl McpConfigService {
     ) -> Result<McpServerResponse, McpError> {
         let config_json = transport.to_config_json()?;
 
-        if let Some(existing) = self.repo.find_by_name_any(name).await? {
+        if let Some(existing) = self.repo.find_by_name_any_for_user(owner_user_id, name).await? {
             if existing.builtin {
                 return Err(McpError::Conflict(format!(
                     "Builtin MCP server name '{name}' is reserved"
@@ -242,7 +328,7 @@ impl McpConfigService {
                 deleted_at: Some(None),
                 ..Default::default()
             };
-            let updated = self.repo.update(&existing.id, params).await?;
+            let updated = self.repo.update_for_user(owner_user_id, &existing.id, params).await?;
             let server = McpServer::from_row(updated)?;
             return Ok(server.into_response());
         }
@@ -257,7 +343,7 @@ impl McpConfigService {
             original_json,
             builtin,
         };
-        let row = self.repo.create(params).await?;
+        let row = self.repo.create_for_user(owner_user_id, params).await?;
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
@@ -386,6 +472,46 @@ mod tests {
         fn now() -> TimestampMs {
             1000
         }
+
+        fn set_owner_and_builtin(&self, id: &str, owner_user_id: &str, builtin: bool) {
+            let mut servers = self.servers.lock().unwrap();
+            let row = servers.iter_mut().find(|server| server.id == id).unwrap();
+            row.owner_user_id = owner_user_id.to_owned();
+            row.builtin = builtin;
+        }
+
+        fn create_owned(
+            &self,
+            owner_user_id: &str,
+            params: CreateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, DbError> {
+            let mut servers = self.servers.lock().unwrap();
+            if servers.iter().any(|s| s.name == params.name) {
+                return Err(DbError::Conflict(format!(
+                    "MCP server name '{}' already exists",
+                    params.name
+                )));
+            }
+            let row = McpServerRow {
+                id: self.next_id(),
+                owner_user_id: owner_user_id.to_owned(),
+                name: params.name.to_owned(),
+                description: params.description.map(String::from),
+                enabled: params.enabled,
+                transport_type: params.transport_type.to_owned(),
+                transport_config: params.transport_config.to_owned(),
+                tools: params.tools.map(String::from),
+                last_test_status: "disconnected".to_owned(),
+                last_connected: None,
+                original_json: params.original_json.map(String::from),
+                builtin: params.builtin,
+                deleted_at: None,
+                created_at: Self::now(),
+                updated_at: Self::now(),
+            };
+            servers.push(row.clone());
+            Ok(row)
+        }
     }
 
     #[async_trait::async_trait]
@@ -418,6 +544,17 @@ mod tests {
             Ok(servers.iter().find(|s| s.name == name).cloned())
         }
 
+        async fn find_by_name_any_for_user(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+            let servers = self.servers.lock().unwrap();
+            Ok(servers
+                .iter()
+                .find(|server| {
+                    server.name == name
+                        && (server.owner_user_id == user_id || server.owner_user_id == aionui_db::SHARED_RESOURCE_OWNER)
+                })
+                .cloned())
+        }
+
         async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
             let servers = self.servers.lock().unwrap();
             Ok(servers
@@ -428,31 +565,15 @@ mod tests {
         }
 
         async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
-            let mut servers = self.servers.lock().unwrap();
-            if servers.iter().any(|s| s.name == params.name) {
-                return Err(DbError::Conflict(format!(
-                    "MCP server name '{}' already exists",
-                    params.name
-                )));
-            }
-            let row = McpServerRow {
-                id: self.next_id(),
-                name: params.name.to_owned(),
-                description: params.description.map(String::from),
-                enabled: params.enabled,
-                transport_type: params.transport_type.to_owned(),
-                transport_config: params.transport_config.to_owned(),
-                tools: params.tools.map(String::from),
-                last_test_status: "disconnected".to_owned(),
-                last_connected: None,
-                original_json: params.original_json.map(String::from),
-                builtin: params.builtin,
-                deleted_at: None,
-                created_at: Self::now(),
-                updated_at: Self::now(),
-            };
-            servers.push(row.clone());
-            Ok(row)
+            self.create_owned(aionui_db::DEFAULT_RESOURCE_OWNER, params)
+        }
+
+        async fn create_for_user(
+            &self,
+            user_id: &str,
+            params: CreateMcpServerParams<'_>,
+        ) -> Result<McpServerRow, DbError> {
+            self.create_owned(user_id, params)
         }
 
         async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
@@ -527,6 +648,7 @@ mod tests {
                     // Create new
                     let row = McpServerRow {
                         id: self.next_id(),
+                        owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
                         name: params.name.to_owned(),
                         description: params.description.map(String::from),
                         enabled: params.enabled,
@@ -1198,5 +1320,87 @@ mod tests {
         assert_eq!(updated.last_test_status, aionui_common::McpServerStatus::Error);
         assert!(updated.tools.is_none());
         assert!(updated.last_connected.is_some());
+    }
+
+    #[tokio::test]
+    async fn persist_test_result_allows_shared_builtin_metadata_update() {
+        let repo = Arc::new(MockMcpServerRepo::new());
+        let svc = McpConfigService::new(repo.clone());
+        let created = svc.add_server(stdio_create_req("shared-builtin")).await.unwrap();
+        repo.set_owner_and_builtin(&created.id, aionui_db::SHARED_RESOURCE_OWNER, true);
+        let result = McpConnectionTestResult {
+            success: true,
+            tools: Some(vec![aionui_api_types::McpToolResponse {
+                name: "shared_tool".into(),
+                description: None,
+                input_schema: None,
+            }]),
+            error: None,
+            code: None,
+            details: None,
+            needs_auth: None,
+            auth_method: None,
+            www_authenticate: None,
+        };
+
+        svc.persist_test_result_for_user("user-a", &created.id, &result)
+            .await
+            .unwrap();
+
+        let updated = svc.get_server_for_user("user-a", &created.id).await.unwrap();
+        assert_eq!(updated.last_test_status, McpServerStatus::Connected);
+        assert_eq!(updated.tools.unwrap()[0].name, "shared_tool");
+    }
+
+    #[tokio::test]
+    async fn persist_test_result_rejects_another_users_personal_server() {
+        let repo = Arc::new(MockMcpServerRepo::new());
+        let svc = McpConfigService::new(repo.clone());
+        let created = svc.add_server(stdio_create_req("private-server")).await.unwrap();
+        repo.set_owner_and_builtin(&created.id, "user-a", false);
+        let result = McpConnectionTestResult {
+            success: true,
+            tools: None,
+            error: None,
+            code: None,
+            details: None,
+            needs_auth: None,
+            auth_method: None,
+            www_authenticate: None,
+        };
+
+        let error = svc
+            .persist_test_result_for_user("user-b", &created.id, &result)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, McpError::NotFound(_)));
+        let unchanged = repo.find_by_id(&created.id).await.unwrap().unwrap();
+        assert_eq!(unchanged.last_test_status, "disconnected");
+    }
+
+    #[tokio::test]
+    async fn persist_test_result_rejects_non_builtin_shared_server() {
+        let repo = Arc::new(MockMcpServerRepo::new());
+        let svc = McpConfigService::new(repo.clone());
+        let created = svc.add_server(stdio_create_req("shared-custom")).await.unwrap();
+        repo.set_owner_and_builtin(&created.id, aionui_db::SHARED_RESOURCE_OWNER, false);
+        let result = McpConnectionTestResult {
+            success: true,
+            tools: None,
+            error: None,
+            code: None,
+            details: None,
+            needs_auth: None,
+            auth_method: None,
+            www_authenticate: None,
+        };
+
+        let error = svc
+            .persist_test_result_for_user("user-a", &created.id, &result)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, McpError::NotFound(_)));
     }
 }

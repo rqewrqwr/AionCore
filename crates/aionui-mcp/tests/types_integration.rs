@@ -16,6 +16,7 @@ use aionui_mcp::{McpServer, McpServerTransport, McpTool};
 fn row(transport_type: &str, transport_config: &str, tools: Option<&str>, status: &str) -> McpServerRow {
     McpServerRow {
         id: "mcp_integration".into(),
+        owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
         name: "integration-test".into(),
         description: Some("Integration test server".into()),
         enabled: true,

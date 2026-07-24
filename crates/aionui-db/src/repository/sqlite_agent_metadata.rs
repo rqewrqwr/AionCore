@@ -9,6 +9,7 @@ use crate::models::{
     AgentMetadataRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpsertAgentMetadataParams,
 };
 use crate::repository::agent_metadata::IAgentMetadataRepository;
+use crate::{DEFAULT_RESOURCE_OWNER, SHARED_RESOURCE_OWNER, resource_owner_subject};
 
 #[derive(Clone, Debug)]
 pub struct SqliteAgentMetadataRepository {
@@ -270,6 +271,15 @@ impl SqliteAgentMetadataRepository {
         }
     }
 
+    async fn fetch_all_safe_one_bind(&self, sql: &str, value: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        let rows = sqlx::query(sql).bind(value).fetch_all(&self.pool).await?;
+        let mut decoded = Vec::with_capacity(rows.len());
+        for row in rows {
+            decoded.push(self.decode_and_repair(row).await?);
+        }
+        Ok(decoded)
+    }
+
     async fn decode_and_repair(&self, row: SqliteRow) -> Result<AgentMetadataRow, DbError> {
         let safe = AgentMetadataSafeRow::from_sqlite_row(row)?;
         let (model, invalid_fields) = safe.into_model();
@@ -319,12 +329,72 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
         .await
     }
 
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        if user_id == DEFAULT_RESOURCE_OWNER {
+            return self.list_all().await;
+        }
+        let owner = resource_owner_subject(user_id);
+        self.fetch_all_safe_one_bind(
+            &format!(
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata a \
+                 WHERE a.agent_source != 'custom' OR EXISTS (\
+                   SELECT 1 FROM zigo_resource_ownership o \
+                   WHERE o.resource_type = 'agent' AND o.resource_id = a.id \
+                     AND o.owner_subject_id IN (?, '{SHARED_RESOURCE_OWNER}') \
+                     AND o.scope IN ('PERSONAL', 'SHARED', 'SYSTEM')\
+                 ) ORDER BY a.sort_order ASC, a.name ASC"
+            ),
+            &owner,
+        )
+        .await
+    }
+
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
         self.fetch_optional_safe(
             &format!("SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata WHERE id = ?"),
             id,
         )
         .await
+    }
+
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        if user_id == DEFAULT_RESOURCE_OWNER {
+            return self.get(id).await;
+        }
+        let owner = resource_owner_subject(user_id);
+        self.fetch_optional_safe_two_binds(
+            &format!(
+                "SELECT {AGENT_METADATA_SAFE_COLUMNS} FROM agent_metadata a \
+                 WHERE a.id = ? AND (a.agent_source != 'custom' OR EXISTS (\
+                   SELECT 1 FROM zigo_resource_ownership o \
+                   WHERE o.resource_type = 'agent' AND o.resource_id = a.id \
+                     AND o.owner_subject_id IN (?, '{SHARED_RESOURCE_OWNER}') \
+                     AND o.scope IN ('PERSONAL', 'SHARED', 'SYSTEM')\
+                 ))"
+            ),
+            id,
+            &owner,
+        )
+        .await
+    }
+
+    async fn assign_to_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let owner = resource_owner_subject(user_id);
+        let now = now_ms();
+        sqlx::query(
+            "INSERT INTO zigo_resource_ownership \
+             (resource_type, resource_id, owner_subject_id, scope, created_at, updated_at) \
+             VALUES ('agent', ?, ?, 'PERSONAL', ?, ?) \
+             ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+               owner_subject_id = excluded.owner_subject_id, scope = excluded.scope, updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn find_by_source_and_name(
@@ -554,10 +624,16 @@ impl IAgentMetadataRepository for SqliteAgentMetadataRepository {
     }
 
     async fn delete(&self, id: &str) -> Result<bool, DbError> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM agent_metadata WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM zigo_resource_ownership WHERE resource_type = 'agent' AND resource_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() > 0)
     }
 }
@@ -674,6 +750,23 @@ mod tests {
             .find(|r| r.name == "Codex CLI" && r.backend.as_deref() == Some("codex") && r.agent_source == "builtin")
             .expect("seeded codex row");
         assert_eq!(codex.yolo_id.as_deref(), Some("agent-full-access"));
+    }
+
+    #[tokio::test]
+    async fn custom_agents_are_user_scoped_while_builtins_remain_shared() {
+        let (repo, _db) = setup().await;
+        repo.upsert(&custom_params("custom-user-a", "Private Agent"))
+            .await
+            .unwrap();
+        repo.assign_to_user("user-a", "custom-user-a").await.unwrap();
+
+        let user_a = repo.list_all_for_user("user-a").await.unwrap();
+        let user_b = repo.list_all_for_user("user-b").await.unwrap();
+        assert!(user_a.iter().any(|row| row.id == "custom-user-a"));
+        assert!(!user_b.iter().any(|row| row.id == "custom-user-a"));
+        assert!(user_b.iter().any(|row| row.agent_source == "builtin"));
+        assert!(repo.get_for_user("user-a", "custom-user-a").await.unwrap().is_some());
+        assert!(repo.get_for_user("user-b", "custom-user-a").await.unwrap().is_none());
     }
 
     #[tokio::test]

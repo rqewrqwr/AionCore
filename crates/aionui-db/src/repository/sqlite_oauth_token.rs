@@ -14,34 +14,26 @@ impl SqliteOAuthTokenRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
-}
 
-#[async_trait::async_trait]
-impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
-    async fn get_by_url(&self, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError> {
-        let row = sqlx::query_as::<_, OAuthTokenRow>("SELECT * FROM oauth_tokens WHERE server_url = ?")
-            .bind(server_url)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn upsert(&self, params: UpsertOAuthTokenParams<'_>) -> Result<OAuthTokenRow, DbError> {
+    async fn upsert_owned(
+        &self,
+        owner_user_id: &str,
+        params: UpsertOAuthTokenParams<'_>,
+    ) -> Result<OAuthTokenRow, DbError> {
         let now = aionui_common::now_ms();
-
         sqlx::query(
             "INSERT INTO oauth_tokens \
-                (server_url, access_token, refresh_token, token_type, \
+                (owner_user_id, server_url, access_token, refresh_token, token_type, \
                  expires_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?) \
-             ON CONFLICT(server_url) DO UPDATE SET \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+             ON CONFLICT(owner_user_id, server_url) DO UPDATE SET \
                 access_token = excluded.access_token, \
                 refresh_token = excluded.refresh_token, \
                 token_type = excluded.token_type, \
                 expires_at = excluded.expires_at, \
                 updated_at = excluded.updated_at",
         )
+        .bind(owner_user_id)
         .bind(params.server_url)
         .bind(params.access_token)
         .bind(params.refresh_token)
@@ -51,18 +43,49 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
         .bind(now)
         .execute(&self.pool)
         .await?;
-
-        // Fetch the row to get the correct created_at (preserved on conflict).
-        let row = self
-            .get_by_url(params.server_url)
+        self.get_by_url_for_user(owner_user_id, params.server_url)
             .await?
-            .ok_or_else(|| DbError::Init("Upsert succeeded but row not found".to_string()))?;
+            .ok_or_else(|| DbError::Init("Upsert succeeded but row not found".to_string()))
+    }
+}
+
+#[async_trait::async_trait]
+impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
+    async fn get_by_url(&self, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError> {
+        self.get_by_url_for_user(crate::DEFAULT_RESOURCE_OWNER, server_url)
+            .await
+    }
+
+    async fn get_by_url_for_user(&self, user_id: &str, server_url: &str) -> Result<Option<OAuthTokenRow>, DbError> {
+        let row =
+            sqlx::query_as::<_, OAuthTokenRow>("SELECT * FROM oauth_tokens WHERE owner_user_id = ? AND server_url = ?")
+                .bind(user_id)
+                .bind(server_url)
+                .fetch_optional(&self.pool)
+                .await?;
 
         Ok(row)
     }
 
+    async fn upsert(&self, params: UpsertOAuthTokenParams<'_>) -> Result<OAuthTokenRow, DbError> {
+        self.upsert_owned(crate::DEFAULT_RESOURCE_OWNER, params).await
+    }
+
+    async fn upsert_for_user(
+        &self,
+        user_id: &str,
+        params: UpsertOAuthTokenParams<'_>,
+    ) -> Result<OAuthTokenRow, DbError> {
+        self.upsert_owned(user_id, params).await
+    }
+
     async fn delete(&self, server_url: &str) -> Result<(), DbError> {
-        let result = sqlx::query("DELETE FROM oauth_tokens WHERE server_url = ?")
+        self.delete_for_user(crate::DEFAULT_RESOURCE_OWNER, server_url).await
+    }
+
+    async fn delete_for_user(&self, user_id: &str, server_url: &str) -> Result<(), DbError> {
+        let result = sqlx::query("DELETE FROM oauth_tokens WHERE owner_user_id = ? AND server_url = ?")
+            .bind(user_id)
             .bind(server_url)
             .execute(&self.pool)
             .await?;
@@ -75,9 +98,16 @@ impl IOAuthTokenRepository for SqliteOAuthTokenRepository {
     }
 
     async fn list_authenticated_urls(&self) -> Result<Vec<String>, DbError> {
-        let rows: Vec<(String,)> = sqlx::query_as("SELECT server_url FROM oauth_tokens ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
+        self.list_authenticated_urls_for_user(crate::DEFAULT_RESOURCE_OWNER)
+            .await
+    }
+
+    async fn list_authenticated_urls_for_user(&self, user_id: &str) -> Result<Vec<String>, DbError> {
+        let rows: Vec<(String,)> =
+            sqlx::query_as("SELECT server_url FROM oauth_tokens WHERE owner_user_id = ? ORDER BY created_at ASC")
+                .bind(user_id)
+                .fetch_all(&self.pool)
+                .await?;
 
         Ok(rows.into_iter().map(|(url,)| url).collect())
     }
@@ -146,6 +176,44 @@ mod tests {
         assert_eq!(updated.expires_at, Some(1800000000000));
         // created_at preserved from original insert
         assert_eq!(updated.created_at, original.created_at);
+    }
+
+    #[tokio::test]
+    async fn oauth_tokens_are_scoped_by_user_and_server_url() {
+        let (repo, _db) = setup().await;
+        repo.upsert_for_user("user-a", sample_params()).await.unwrap();
+        repo.upsert_for_user(
+            "user-b",
+            UpsertOAuthTokenParams {
+                access_token: "user-b-token",
+                ..sample_params()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            repo.get_by_url_for_user("user-a", "https://mcp.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "enc_access_token_123"
+        );
+        assert_eq!(
+            repo.get_by_url_for_user("user-b", "https://mcp.example.com")
+                .await
+                .unwrap()
+                .unwrap()
+                .access_token,
+            "user-b-token"
+        );
+        assert!(
+            repo.get_by_url_for_user("user-c", "https://mcp.example.com")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

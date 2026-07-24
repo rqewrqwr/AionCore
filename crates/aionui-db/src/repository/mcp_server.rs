@@ -14,11 +14,34 @@ pub trait IMcpServerRepository: Send + Sync {
     /// Returns all MCP servers, ordered by creation time ascending.
     async fn list(&self) -> Result<Vec<McpServerRow>, DbError>;
 
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
+        Ok(self
+            .list()
+            .await?
+            .into_iter()
+            .filter(|row| row.owner_user_id == user_id || row.owner_user_id == crate::SHARED_RESOURCE_OWNER)
+            .collect())
+    }
+
     /// Finds an MCP server by ID, or `None` if not found.
     async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError>;
 
+    async fn find_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        Ok(self
+            .find_by_id(id)
+            .await?
+            .filter(|row| row.owner_user_id == user_id || row.owner_user_id == crate::SHARED_RESOURCE_OWNER))
+    }
+
     /// Finds an MCP server by name, or `None` if not found.
     async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError>;
+
+    async fn find_by_name_for_user(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        Ok(self
+            .find_by_name(name)
+            .await?
+            .filter(|row| row.owner_user_id == user_id || row.owner_user_id == crate::SHARED_RESOURCE_OWNER))
+    }
 
     /// Finds an MCP server by ID, including soft-deleted rows.
     async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
@@ -28,6 +51,10 @@ pub trait IMcpServerRepository: Send + Sync {
     /// Finds an MCP server by name, including soft-deleted rows.
     async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
         self.find_by_name(name).await
+    }
+
+    async fn find_by_name_any_for_user(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        self.find_by_name_for_user(user_id, name).await
     }
 
     /// Finds a set of MCP servers by ID, including soft-deleted rows.
@@ -41,17 +68,55 @@ pub trait IMcpServerRepository: Send + Sync {
         Ok(rows)
     }
 
+    async fn list_by_ids_for_user(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+        Ok(self
+            .list_by_ids_any(ids)
+            .await?
+            .into_iter()
+            .filter(|row| row.owner_user_id == user_id || row.owner_user_id == crate::SHARED_RESOURCE_OWNER)
+            .collect())
+    }
+
     /// Creates a new MCP server and returns the inserted row.
     /// Returns `DbError::Conflict` if the name already exists.
     async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError>;
+
+    async fn create_for_user(
+        &self,
+        _user_id: &str,
+        params: CreateMcpServerParams<'_>,
+    ) -> Result<McpServerRow, DbError> {
+        self.create(params).await
+    }
 
     /// Updates an existing MCP server. Returns `DbError::NotFound` if the ID
     /// doesn't exist, `DbError::Conflict` if the new name collides with another.
     async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError>;
 
+    async fn update_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        params: UpdateMcpServerParams<'_>,
+    ) -> Result<McpServerRow, DbError> {
+        self.find_by_id_for_user(user_id, id)
+            .await?
+            .filter(|row| row.owner_user_id == user_id)
+            .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
+        self.update(id, params).await
+    }
+
     /// Soft-deletes an MCP server by ID. Returns `DbError::NotFound` if the ID
     /// doesn't exist.
     async fn delete(&self, id: &str) -> Result<(), DbError>;
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.find_by_id_for_user(user_id, id)
+            .await?
+            .filter(|row| row.owner_user_id == user_id)
+            .ok_or_else(|| DbError::NotFound(format!("MCP server '{id}' not found")))?;
+        self.delete(id).await
+    }
 
     /// Upserts multiple servers by name: existing names are updated,
     /// new names are inserted. Returns the count of affected rows.

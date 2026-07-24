@@ -724,6 +724,7 @@ impl StreamRelay {
         let middleware = MessageMiddleware::new_with_skill_loader(self.skill_resolver.as_ref().map(|resolver| {
             Box::new(SharedSkillResolver {
                 resolver: Arc::clone(resolver),
+                user_id: self.user_id.clone(),
                 allowed_skill_names: self.allowed_skill_names.clone(),
             }) as Box<dyn ISkillLoadService>
         }));
@@ -768,6 +769,7 @@ impl StreamRelay {
 
 struct SharedSkillResolver {
     resolver: Arc<dyn SkillResolver>,
+    user_id: String,
     allowed_skill_names: Vec<String>,
 }
 
@@ -782,7 +784,7 @@ impl ISkillLoadService for SharedSkillResolver {
             .filter(|name| self.allowed_skill_names.iter().any(|allowed| allowed == *name))
             .cloned()
             .collect();
-        self.resolver.load_skill_bodies(&filtered).await
+        self.resolver.load_skill_bodies_for_user(&self.user_id, &filtered).await
     }
 }
 
@@ -874,6 +876,7 @@ mod tests {
         let resolver: Arc<dyn SkillResolver> = concrete.clone();
         let loader = SharedSkillResolver {
             resolver,
+            user_id: "user-1".into(),
             allowed_skill_names: vec!["cron".into()],
         };
 

@@ -22,6 +22,8 @@ async fn migration_creates_skill_management_tables() {
             "deleted_at",
             "created_at",
             "updated_at",
+            "owner_user_id",
+            "display_name",
         ]
     );
 
@@ -49,6 +51,7 @@ async fn migration_creates_skill_management_tables() {
             "line",
             "column",
             "created_at",
+            "owner_user_id",
         ]
     );
 }

@@ -26,10 +26,21 @@ pub trait SkillResolver: Send + Sync {
     /// same search order as `materialize_skills_for_agent`.
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill>;
 
+    /// Resolve skills in the authenticated user's catalog. Implementations
+    /// that do not persist user data may keep the legacy behavior.
+    async fn resolve_skills_for_user(&self, _user_id: &str, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills(names).await
+    }
+
     /// Load full skill bodies for prompt-protocol agents that request
     /// `[LOAD_SKILL: name]` in their response.
     async fn load_skill_bodies(&self, names: &[String]) -> Vec<LoadedAgentSkill> {
         let resolved = self.resolve_skills(names).await;
+        load_resolved_skill_bodies(&resolved).await
+    }
+
+    async fn load_skill_bodies_for_user(&self, user_id: &str, names: &[String]) -> Vec<LoadedAgentSkill> {
+        let resolved = self.resolve_skills_for_user(user_id, names).await;
         load_resolved_skill_bodies(&resolved).await
     }
 
@@ -119,14 +130,20 @@ impl SkillResolver for ExtensionSkillResolver {
     }
 
     async fn resolve_skills(&self, names: &[String]) -> Vec<ResolvedAgentSkill> {
+        self.resolve_skills_for_user(aionui_db::DEFAULT_SKILL_OWNER, names)
+            .await
+    }
+
+    async fn resolve_skills_for_user(&self, user_id: &str, names: &[String]) -> Vec<ResolvedAgentSkill> {
         if names.is_empty() {
             return Vec::new();
         }
         // Conversation_id is validated upstream; we don't use a real one here
         // because this resolver is purely a path-resolution helper.
-        match aionui_extension::materialize_skills_for_agent_with_repo(
+        match aionui_extension::materialize_skills_for_agent_with_repo_for_owner(
             &self.paths,
             self.skill_repo.as_ref(),
+            user_id,
             "workspace-link",
             names,
         )

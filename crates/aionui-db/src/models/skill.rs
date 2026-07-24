@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub struct SkillRow {
     pub id: String,
     pub name: String,
+    pub owner_user_id: String,
     pub description: Option<String>,
     pub path: String,
     pub source: String,
@@ -23,6 +24,7 @@ pub struct SkillImportRecordRow {
     pub source_label: String,
     pub source_path: Option<String>,
     pub source_name: String,
+    pub owner_user_id: String,
     pub skill_id: Option<String>,
     pub skill_name: Option<String>,
     pub status: String,

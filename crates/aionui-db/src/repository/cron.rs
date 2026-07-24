@@ -74,20 +74,60 @@ pub trait ICronRepository: Send + Sync {
     /// Returns `DbError::NotFound` if absent.
     async fn update(&self, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError>;
 
+    async fn update_for_user(&self, user_id: &str, id: &str, params: &UpdateCronJobParams) -> Result<(), DbError> {
+        self.get_by_id_for_user(user_id, id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("cron job '{id}'")))?;
+        self.update(id, params).await
+    }
+
     /// Deletes a cron job by ID. Returns `DbError::NotFound` if absent.
     async fn delete(&self, id: &str) -> Result<(), DbError>;
+
+    async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        self.get_by_id_for_user(user_id, id)
+            .await?
+            .ok_or_else(|| DbError::NotFound(format!("cron job '{id}'")))?;
+        self.delete(id).await
+    }
 
     /// Returns a single cron job by ID, or `None` if not found.
     async fn get_by_id(&self, id: &str) -> Result<Option<CronJobRow>, DbError>;
 
+    async fn get_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<CronJobRow>, DbError> {
+        Ok(self.get_by_id(id).await?.filter(|row| row.owner_user_id == user_id))
+    }
+
     /// Returns all cron jobs ordered by creation time ascending.
     async fn list_all(&self) -> Result<Vec<CronJobRow>, DbError>;
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<CronJobRow>, DbError> {
+        Ok(self
+            .list_all()
+            .await?
+            .into_iter()
+            .filter(|row| row.owner_user_id == user_id)
+            .collect())
+    }
 
     /// Returns all enabled cron jobs.
     async fn list_enabled(&self) -> Result<Vec<CronJobRow>, DbError>;
 
     /// Returns all cron jobs for a given conversation.
     async fn list_by_conversation(&self, conversation_id: &str) -> Result<Vec<CronJobRow>, DbError>;
+
+    async fn list_by_conversation_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<CronJobRow>, DbError> {
+        Ok(self
+            .list_by_conversation(conversation_id)
+            .await?
+            .into_iter()
+            .filter(|row| row.owner_user_id == user_id)
+            .collect())
+    }
 
     /// Deletes all cron jobs associated with a conversation.
     /// Returns the number of deleted rows.

@@ -19,6 +19,7 @@ use aionui_db::{
     SqliteUserRepository,
 };
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
+use aionui_workspace::{WorkspaceAccessPort, WorkspaceService};
 
 pub struct AppServices {
     pub database: Database,
@@ -53,8 +54,10 @@ pub struct AppServices {
     pub skill_paths: Arc<aionui_extension::SkillPaths>,
     /// User skill metadata and import history repository.
     pub skill_repo: Arc<dyn ISkillRepository>,
+    pub workspace_service: Arc<WorkspaceService>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    runtime_private_gateway_url: Option<String>,
 }
 
 impl AppServices {
@@ -64,6 +67,10 @@ impl AppServices {
 
     pub(crate) fn runtime_base_url(&self) -> String {
         self.runtime_base_url.clone()
+    }
+
+    pub(crate) fn runtime_private_gateway_url(&self) -> Option<String> {
+        self.runtime_private_gateway_url.clone()
     }
 
     /// Replace the worker task manager after construction.
@@ -83,6 +90,10 @@ impl AppServices {
             task_manager_delete_hook: self.task_manager_delete_hook.clone(),
             runtime_helper_bin: self.runtime_helper_bin.clone(),
             runtime_base_url: self.runtime_base_url.clone(),
+            jwt_service: self.jwt_service.clone(),
+            runtime_private_gateway_url: self.runtime_private_gateway_url.clone(),
+            workspace_service: self.workspace_service.clone(),
+            local: self.local,
         });
         self
     }
@@ -119,6 +130,7 @@ impl AppServices {
         }
 
         let encryption_key = derive_encryption_key(&secret);
+        let jwt_service = Arc::new(JwtService::new(secret.clone()));
 
         let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
@@ -142,6 +154,8 @@ impl AppServices {
         let conversation_repo: Arc<dyn IConversationRepository> =
             Arc::new(SqliteConversationRepository::new(database.pool().clone()));
         let skill_repo: Arc<dyn ISkillRepository> = Arc::new(SqliteSkillRepository::new(database.pool().clone()));
+        let workspace_repo = Arc::new(aionui_db::SqliteWorkspaceRepository::new(database.pool().clone()));
+        let workspace_service = Arc::new(WorkspaceService::new(workspace_repo, work_dir.clone(), local));
 
         // Skill paths need app resource dir (for builtin rules) + data dir
         // (for user skills + materialized views). AcpSkillManager uses these
@@ -163,6 +177,10 @@ impl AppServices {
             Arc::new(std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("aioncore")));
         let runtime_helper_bin = backend_binary_path.to_string_lossy().into_owned();
         let runtime_base_url = config.local_base_url();
+        let runtime_private_gateway_url = std::env::var("AIONUI_PRIVATE_GATEWAY_URL")
+            .ok()
+            .map(|value| value.trim_end_matches('/').to_owned())
+            .filter(|value| !value.is_empty());
 
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
@@ -200,11 +218,15 @@ impl AppServices {
             task_manager_delete_hook: Some(task_manager_delete_hook.clone()),
             runtime_helper_bin: runtime_helper_bin.clone(),
             runtime_base_url: runtime_base_url.clone(),
+            jwt_service: jwt_service.clone(),
+            runtime_private_gateway_url: runtime_private_gateway_url.clone(),
+            workspace_service: workspace_service.clone(),
+            local,
         });
 
         Ok(Self {
             database,
-            jwt_service: Arc::new(JwtService::new(secret.clone())),
+            jwt_service,
             user_repo,
             cookie_config: Arc::new(CookieConfig::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
@@ -226,8 +248,10 @@ impl AppServices {
             app_version,
             skill_paths,
             skill_repo,
+            workspace_service,
             runtime_helper_bin,
             runtime_base_url,
+            runtime_private_gateway_url,
         })
     }
 }
@@ -244,6 +268,10 @@ struct ConversationServiceDeps<'a> {
     task_manager_delete_hook: Option<Arc<dyn OnConversationDelete>>,
     runtime_helper_bin: String,
     runtime_base_url: String,
+    jwt_service: Arc<JwtService>,
+    runtime_private_gateway_url: Option<String>,
+    workspace_service: Arc<WorkspaceService>,
+    local: bool,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -261,7 +289,11 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
         Arc::new(SqliteAcpSessionRepository::new(deps.database.pool().clone())),
     )
     .with_runtime_state(deps.conversation_runtime_state)
-    .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url);
+    .with_runtime_helper_context(deps.runtime_helper_bin, deps.runtime_base_url)
+    .with_runtime_auth_context(deps.jwt_service, deps.runtime_private_gateway_url);
+    if !deps.local {
+        service.with_workspace_access(deps.workspace_service as Arc<dyn WorkspaceAccessPort>);
+    }
     service.with_mcp_server_repo(Arc::new(SqliteMcpServerRepository::new(deps.database.pool().clone())));
     service.with_assistant_definition_repo(Arc::new(SqliteAssistantDefinitionRepository::new(
         deps.database.pool().clone(),

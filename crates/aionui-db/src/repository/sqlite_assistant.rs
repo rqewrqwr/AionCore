@@ -1,6 +1,7 @@
 //! SQLite-backed assistant repositories.
 
 use aionui_common::{TimestampMs, now_ms};
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
@@ -365,6 +366,38 @@ impl IAssistantDefinitionRepository for SqliteAssistantDefinitionRepository {
             "SELECT * FROM assistant_definitions WHERE assistant_id = ? AND deleted_at IS NULL",
         )
         .bind(assistant_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn get_by_assistant_id_for_user(
+        &self,
+        user_id: &str,
+        assistant_id: &str,
+    ) -> Result<Option<AssistantDefinitionRow>, DbError> {
+        if user_id == crate::DEFAULT_RESOURCE_OWNER {
+            return self.get_by_assistant_id(assistant_id).await;
+        }
+
+        let owner_subject_id = hex::encode(Sha256::digest(user_id.as_bytes()))[..24].to_owned();
+        let row = sqlx::query_as::<_, AssistantDefinitionRow>(
+            r#"SELECT d.*
+               FROM assistant_definitions d
+               LEFT JOIN zigo_resource_ownership o
+                 ON o.resource_type = 'assistant'
+                AND o.resource_id = d.assistant_id
+               WHERE d.assistant_id = ?
+                 AND d.deleted_at IS NULL
+                 AND (
+                   lower(d.owner_type) = 'system'
+                   OR o.owner_subject_id IN (?, ?)
+                 )
+               LIMIT 1"#,
+        )
+        .bind(assistant_id)
+        .bind(owner_subject_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
         .fetch_optional(&self.pool)
         .await?;
         Ok(row)
@@ -1020,6 +1053,37 @@ mod tests {
         assert_eq!(fetched.rule_inline_content.as_deref(), Some("# rule"));
         assert_eq!(fetched.avatar_type, "emoji");
         assert_eq!(fetched.avatar_value.as_deref(), Some("🤖"));
+    }
+
+    #[tokio::test]
+    async fn user_assistant_definition_requires_matching_ownership() {
+        let (d, _s, _p, db) = setup_v2().await;
+        d.upsert(&definition_params("private-assistant", "Private"))
+            .await
+            .unwrap();
+        let owner_subject_id = hex::encode(Sha256::digest(b"user-a"))[..24].to_owned();
+        sqlx::query(
+            "INSERT INTO zigo_resource_ownership \
+             (resource_type, resource_id, owner_subject_id, scope, created_at, updated_at) \
+             VALUES ('assistant', 'private-assistant', ?, 'PERSONAL', 0, 0)",
+        )
+        .bind(owner_subject_id)
+        .execute(db.pool())
+        .await
+        .unwrap();
+
+        assert!(
+            d.get_by_assistant_id_for_user("user-a", "private-assistant")
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            d.get_by_assistant_id_for_user("user-b", "private-assistant")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

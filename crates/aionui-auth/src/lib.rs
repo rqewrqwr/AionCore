@@ -18,7 +18,10 @@ mod validation;
 pub use error::AuthError;
 
 // JWT service
-pub use jwt::{JwtService, TokenPayload, generate_random_secret_string, resolve_jwt_secret};
+pub use jwt::{
+    AGENT_SKILL_CONFIG_SCOPE, AgentRuntimeToken, JwtService, TokenPayload, generate_random_secret_string,
+    resolve_jwt_secret,
+};
 
 // Password service
 pub use password::{

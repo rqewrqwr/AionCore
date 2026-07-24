@@ -21,7 +21,7 @@ use aionui_db::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteClientPreferenceRepository,
     SqliteConversationRepository, SqliteFeedbackDiagnosticsRepository, SqliteProviderRepository,
-    SqliteRemoteAgentRepository, SqliteSettingsRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteWorkspaceRepository,
 };
 use aionui_extension::{
     AssistantRuleDispatcher, ExtensionRegistry, ExtensionRouterState, ExtensionStateStore, ExternalPathsManager,
@@ -47,6 +47,7 @@ use aionui_team::{
     AgentTurnCancellationPort, AgentTurnExecutionPort, TeamAssistantCatalogEntry, TeamAssistantCatalogPort,
     TeamConversationProvisioningPort, TeamProjectionMessageStore, TeamRouterState, TeamSessionService,
 };
+use aionui_workspace::{WorkspaceAccessPort, WorkspaceRouterState};
 
 use crate::config::derive_encryption_key;
 use crate::router::team_conversation_adapters::TeamConversationAdapters;
@@ -118,6 +119,7 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    pub workspace: WorkspaceRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -283,6 +285,7 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        workspace: build_module_state_phase(&boot, "workspace", || build_workspace_state(services)),
     };
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -420,9 +423,18 @@ pub fn build_file_state(services: &AppServices) -> Result<FileRouterState, Route
         file_service,
         watch_service,
         snapshot_service,
+        conversation_repo: services.conversation_repo.clone(),
+        workspace_repo: Arc::new(SqliteWorkspaceRepository::new(services.database.pool().clone())),
+        local_mode: services.local,
         allowed_roots,
         browse_roots,
     })
+}
+
+pub fn build_workspace_state(services: &AppServices) -> WorkspaceRouterState {
+    WorkspaceRouterState {
+        service: services.workspace_service.clone(),
+    }
 }
 
 fn file_watch_init_error(error: aionui_file::FileError) -> RouterBuildError {
@@ -679,7 +691,11 @@ pub fn build_cron_state(services: &AppServices) -> CronRouterState {
         acp_session_repo,
     )
     .with_runtime_state(services.conversation_runtime_state.clone())
-    .with_runtime_helper_context(services.runtime_helper_bin(), services.runtime_base_url());
+    .with_runtime_helper_context(services.runtime_helper_bin(), services.runtime_base_url())
+    .with_runtime_auth_context(services.jwt_service.clone(), services.runtime_private_gateway_url());
+    if !services.local {
+        conv_service.with_workspace_access(services.workspace_service.clone() as Arc<dyn WorkspaceAccessPort>);
+    }
     conv_service.with_mcp_server_repo(Arc::new(aionui_db::SqliteMcpServerRepository::new(
         services.database.pool().clone(),
     )));
@@ -759,6 +775,10 @@ pub fn build_office_state(services: &AppServices) -> OfficeRouterState {
         conversion_service,
         proxy_service,
         allowed_roots,
+        conversation_repo: Some(services.conversation_repo.clone()),
+        local_mode: services.local,
+        preview_port_owners: Default::default(),
+        preview_path_owners: Default::default(),
     }
 }
 

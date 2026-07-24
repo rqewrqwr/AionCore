@@ -1357,6 +1357,7 @@ async fn list_jobs_allows_legacy_custom_agent_id_without_assistant_id() {
     cron_repo
         .insert(&CronJobRow {
             id: "cron_legacy_custom_agent".into(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: "Legacy custom agent job".into(),
             enabled: true,
             schedule_kind: "every".into(),

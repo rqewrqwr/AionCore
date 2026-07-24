@@ -134,6 +134,10 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         jwt_service: state.jwt_service.clone(),
         user_repo: state.user_repo.clone(),
         local: false,
+        private_asset_gateway_secret: std::env::var(crate::middleware::PRIVATE_ASSET_GATEWAY_SECRET_ENV)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
     };
 
     // Auth rate limited routes (login, qr-login)

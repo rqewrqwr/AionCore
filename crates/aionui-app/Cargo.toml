@@ -36,6 +36,7 @@ aionui-team-prompts.workspace = true
 aionui-cron.workspace = true
 aionui-assistant.workspace = true
 aionui-runtime.workspace = true
+aionui-workspace.workspace = true
 axum.workspace = true
 chrono.workspace = true
 dirs.workspace = true

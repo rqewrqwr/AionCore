@@ -26,7 +26,7 @@ use crate::scheduler::{CronScheduler, compute_next_run, compute_next_run_after_o
 use crate::skill_file::{delete_skill_file, has_skill_file, write_raw_skill_file, write_skill_file};
 use crate::types::{
     CreatedBy, CronAgentConfig, CronJob, CronSchedule, ExecutionMode, cron_job_from_row, cron_job_to_response,
-    cron_job_to_row, schedule_from_dto,
+    cron_job_to_row_for_owner, schedule_from_dto,
 };
 
 const PLACEHOLDER_PATTERNS: &[&str] = &[
@@ -88,7 +88,11 @@ impl CronService {
     // -----------------------------------------------------------------------
 
     pub async fn add_job(&self, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
-        self.add_job_internal(req, None, None).await
+        self.add_job_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn add_job_for_user(&self, user_id: &str, req: CreateCronJobRequest) -> Result<CronJob, CronError> {
+        self.add_job_internal(user_id, req, None, None).await
     }
 
     pub async fn create_for_conversation_helper(
@@ -125,7 +129,7 @@ impl CronService {
         };
 
         let job = self
-            .add_job_internal(create_req, Some(agent_type), assistant_backend_override)
+            .add_job_internal(user_id, create_req, Some(agent_type), assistant_backend_override)
             .await?;
         if let Err(err) = self
             .executor
@@ -166,9 +170,12 @@ impl CronService {
     ) -> Result<Vec<CronJob>, CronError> {
         self.verify_conversation_helper_context(user_id, conversation_id)
             .await?;
-        self.list_jobs(&ListCronJobsQuery {
-            conversation_id: Some(conversation_id.to_owned()),
-        })
+        self.list_jobs_for_user(
+            user_id,
+            &ListCronJobsQuery {
+                conversation_id: Some(conversation_id.to_owned()),
+            },
+        )
         .await
     }
 
@@ -182,13 +189,14 @@ impl CronService {
         self.verify_conversation_helper_context(user_id, conversation_id)
             .await?;
 
-        let existing = self.get_job(job_id).await?;
+        let existing = self.get_job_for_user(user_id, job_id).await?;
         if existing.conversation_id != conversation_id {
             return Err(CronError::JobNotFound(job_id.to_owned()));
         }
 
         let job = self
-            .update_job(
+            .update_job_for_user(
+                user_id,
                 job_id,
                 UpdateCronJobRequest {
                     name: Some(req.name),
@@ -244,6 +252,7 @@ impl CronService {
 
     async fn add_job_internal(
         &self,
+        owner_user_id: &str,
         req: CreateCronJobRequest,
         runtime_agent_type: Option<String>,
         assistant_backend_override: Option<String>,
@@ -303,7 +312,7 @@ impl CronService {
 
         self.validate_job_workspace(&job).await?;
 
-        let row = cron_job_to_row(&job)?;
+        let row = cron_job_to_row_for_owner(&job, owner_user_id)?;
         self.repo.insert(&row).await?;
         self.bind_existing_conversation_if_needed(&job).await;
         self.scheduler.schedule_job(&job);
@@ -429,6 +438,16 @@ impl CronService {
         Ok(job)
     }
 
+    pub async fn update_job_for_user(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        req: UpdateCronJobRequest,
+    ) -> Result<CronJob, CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.update_job(job_id, req).await
+    }
+
     pub async fn remove_job(&self, job_id: &str) -> Result<(), CronError> {
         self.scheduler.cancel_job(job_id);
         if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
@@ -440,12 +459,34 @@ impl CronService {
         Ok(())
     }
 
+    pub async fn remove_job_for_user(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.scheduler.cancel_job(job_id);
+        if let Err(err) = delete_skill_file(&self.data_dir, job_id).await {
+            warn!(job_id, error = %err, "Failed to delete cron skill file during job removal");
+        }
+        self.repo.delete_for_user(user_id, job_id).await?;
+        self.emitter.emit_job_removed(job_id);
+        info!(job_id, user_id, "Cron job removed");
+        Ok(())
+    }
+
     pub async fn get_job(&self, job_id: &str) -> Result<CronJob, CronError> {
         let row = self
             .repo
             .get_by_id(job_id)
             .await?
             .ok_or_else(|| CronError::JobNotFound(job_id.to_owned()))?;
+        let mut job = cron_job_from_row(row)?;
+        job.agent_type = self.resolve_job_agent_type(&job).await?;
+        Ok(job)
+    }
+
+    pub async fn get_job_for_user(&self, user_id: &str, job_id: &str) -> Result<CronJob, CronError> {
+        let row = self.repo.get_by_id_for_user(user_id, job_id).await?.ok_or_else(|| {
+            warn!(user_id, job_id, "cron job access denied");
+            CronError::JobNotFound(job_id.to_owned())
+        })?;
         let mut job = cron_job_from_row(row)?;
         job.agent_type = self.resolve_job_agent_type(&job).await?;
         Ok(job)
@@ -465,6 +506,33 @@ impl CronService {
             jobs.push(job);
         }
         Ok(jobs)
+    }
+
+    pub async fn list_jobs_for_user(
+        &self,
+        user_id: &str,
+        query: &ListCronJobsQuery,
+    ) -> Result<Vec<CronJob>, CronError> {
+        let rows = if let Some(conv_id) = &query.conversation_id {
+            self.repo.list_by_conversation_for_user(user_id, conv_id).await?
+        } else {
+            self.repo.list_for_user(user_id).await?
+        };
+        let mut jobs = Vec::with_capacity(rows.len());
+        for row in rows {
+            let mut job = cron_job_from_row(row)?;
+            job.agent_type = self.resolve_job_agent_type(&job).await?;
+            jobs.push(job);
+        }
+        Ok(jobs)
+    }
+
+    async fn require_job_owner(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
+        if self.repo.get_by_id_for_user(user_id, job_id).await?.is_some() {
+            return Ok(());
+        }
+        warn!(user_id, job_id, "cron job access denied");
+        Err(CronError::JobNotFound(job_id.to_owned()))
     }
 
     // -----------------------------------------------------------------------
@@ -714,6 +782,11 @@ impl CronService {
         Ok(RunNowResponse { conversation_id })
     }
 
+    pub async fn run_now_for_user(&self, user_id: &str, job_id: &str) -> Result<RunNowResponse, CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.run_now(job_id).await
+    }
+
     // -----------------------------------------------------------------------
     // Skill management
     // -----------------------------------------------------------------------
@@ -740,6 +813,16 @@ impl CronService {
         Ok(())
     }
 
+    pub async fn save_skill_for_user(
+        &self,
+        user_id: &str,
+        job_id: &str,
+        req: SaveCronSkillRequest,
+    ) -> Result<(), CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.save_skill(job_id, req).await
+    }
+
     pub async fn has_skill(&self, job_id: &str) -> Result<HasSkillResponse, CronError> {
         let row = self
             .repo
@@ -751,6 +834,11 @@ impl CronService {
             || row.skill_content.as_ref().is_some_and(|s| !s.trim().is_empty());
 
         Ok(HasSkillResponse { has_skill })
+    }
+
+    pub async fn has_skill_for_user(&self, user_id: &str, job_id: &str) -> Result<HasSkillResponse, CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.has_skill(job_id).await
     }
 
     pub async fn delete_skill(&self, job_id: &str) -> Result<(), CronError> {
@@ -769,6 +857,11 @@ impl CronService {
 
         info!(job_id, "Skill content deleted");
         Ok(())
+    }
+
+    pub async fn delete_skill_for_user(&self, user_id: &str, job_id: &str) -> Result<(), CronError> {
+        self.require_job_owner(user_id, job_id).await?;
+        self.delete_skill(job_id).await
     }
 
     // -----------------------------------------------------------------------

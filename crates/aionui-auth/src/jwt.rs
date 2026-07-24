@@ -12,6 +12,21 @@ use crate::error::AuthError;
 
 /// JWT token lifetime: 24 hours.
 const TOKEN_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
+const AGENT_RUNTIME_TOKEN_EXPIRY: Duration = Duration::from_secs(15 * 60);
+const AGENT_RUNTIME_TOKEN_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+pub const AGENT_SKILL_CONFIG_SCOPE: &str = "agent-skill-config";
+
+/// Short-lived credential injected into one conversation runtime.
+///
+/// `renewal_generation` changes before the token can expire. Runtime task
+/// managers use it to replace a long-lived Agent/MCP process at the next turn
+/// boundary, which injects a freshly signed token without weakening its scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRuntimeToken {
+    pub token: String,
+    pub renewal_generation: u64,
+}
 
 /// JWT issuer claim value.
 const JWT_ISSUER: &str = "aionui";
@@ -34,6 +49,10 @@ pub struct TokenPayload {
     pub iss: String,
     /// Audience (standard JWT claim).
     pub aud: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversation_id: Option<String>,
 }
 
 /// JWT service for signing, verification, and token blacklisting.
@@ -69,19 +88,53 @@ impl JwtService {
             exp,
             iss: JWT_ISSUER.to_owned(),
             aud: JWT_AUDIENCE.to_owned(),
+            scope: None,
+            conversation_id: None,
         };
 
+        self.encode_claims(&claims)
+    }
+
+    /// Sign a short-lived token restricted to one conversation's private
+    /// configuration gateway.
+    pub fn sign_agent_skill_config(&self, user_id: &str, conversation_id: &str) -> Result<String, AuthError> {
+        self.sign_agent_skill_config_with_renewal(user_id, conversation_id)
+            .map(|credential| credential.token)
+    }
+
+    /// Sign a scoped runtime token and return the renewal generation that owns
+    /// it. A generation is deliberately shorter than the token lifetime so a
+    /// resumed conversation refreshes its Agent/MCP processes before expiry.
+    pub fn sign_agent_skill_config_with_renewal(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<AgentRuntimeToken, AuthError> {
+        let now = now_secs()?;
+        let claims = TokenPayload {
+            user_id: user_id.to_owned(),
+            username: String::new(),
+            iat: now,
+            exp: now + AGENT_RUNTIME_TOKEN_EXPIRY.as_secs(),
+            iss: JWT_ISSUER.to_owned(),
+            aud: JWT_AUDIENCE.to_owned(),
+            scope: Some(AGENT_SKILL_CONFIG_SCOPE.to_owned()),
+            conversation_id: Some(conversation_id.to_owned()),
+        };
+        Ok(AgentRuntimeToken {
+            token: self.encode_claims(&claims)?,
+            renewal_generation: agent_runtime_token_generation(now),
+        })
+    }
+
+    fn encode_claims(&self, claims: &TokenPayload) -> Result<String, AuthError> {
         let secret = self
             .secret
             .read()
             .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
 
-        encode(
-            &Header::default(),
-            &claims,
-            &EncodingKey::from_secret(secret.as_bytes()),
-        )
-        .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
+        encode(&Header::default(), claims, &EncodingKey::from_secret(secret.as_bytes()))
+            .map_err(|e| AuthError::TokenInvalid(format!("JWT encoding failed: {e}")))
     }
 
     /// Verify a JWT and return its payload.
@@ -193,6 +246,10 @@ fn now_secs() -> Result<u64, AuthError> {
         .map_err(|e| AuthError::TokenInvalid(format!("System clock error: {e}")))
 }
 
+fn agent_runtime_token_generation(now: u64) -> u64 {
+    now / AGENT_RUNTIME_TOKEN_RENEWAL_INTERVAL.as_secs()
+}
+
 /// Compute the SHA-256 hash of a token string, returned as hex.
 fn token_hash(token: &str) -> String {
     let mut hasher = Sha256::new();
@@ -234,6 +291,30 @@ mod tests {
     }
 
     #[test]
+    fn agent_skill_config_token_is_scoped_and_short_lived() {
+        let service = test_service();
+        let credential = service
+            .sign_agent_skill_config_with_renewal("user_1", "conv_1")
+            .unwrap();
+        let payload = service.verify(&credential.token).unwrap();
+        assert_eq!(payload.scope.as_deref(), Some(AGENT_SKILL_CONFIG_SCOPE));
+        assert_eq!(payload.conversation_id.as_deref(), Some("conv_1"));
+        assert_eq!(payload.exp - payload.iat, AGENT_RUNTIME_TOKEN_EXPIRY.as_secs());
+        assert_eq!(
+            credential.renewal_generation,
+            agent_runtime_token_generation(payload.iat)
+        );
+    }
+
+    #[test]
+    fn agent_runtime_token_generation_advances_before_token_expiry() {
+        let interval = AGENT_RUNTIME_TOKEN_RENEWAL_INTERVAL.as_secs();
+        assert!(interval < AGENT_RUNTIME_TOKEN_EXPIRY.as_secs());
+        assert_eq!(agent_runtime_token_generation(interval - 1), 0);
+        assert_eq!(agent_runtime_token_generation(interval), 1);
+    }
+
+    #[test]
     fn verify_tampered_token_fails() {
         let service = test_service();
         let token = service.sign("user_1", "admin").unwrap();
@@ -261,6 +342,8 @@ mod tests {
             exp: 1001,
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
+            scope: None,
+            conversation_id: None,
         };
         let token = encode(
             &Header::default(),
@@ -342,6 +425,8 @@ mod tests {
             exp: 1001,
             iss: JWT_ISSUER.into(),
             aud: JWT_AUDIENCE.into(),
+            scope: None,
+            conversation_id: None,
         };
         let token = encode(
             &Header::default(),

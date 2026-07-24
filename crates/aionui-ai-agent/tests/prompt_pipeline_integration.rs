@@ -56,6 +56,7 @@ async fn fixture_params(
     Arc::new(
         assemble_acp_params(
             "conv-pp-test".into(),
+            "user-1".into(),
             WorkspaceInfo {
                 path: "/tmp".into(),
                 is_custom: is_custom_workspace,

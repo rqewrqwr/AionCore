@@ -1,4 +1,4 @@
-//! CLI argument definitions for the `aioncore` binary.
+//! CLI argument definitions for the ZigoCore binary (`aioncore` remains a compatibility filename).
 //!
 //! Kept separate from `main.rs` to isolate the clap surface (struct + enum +
 //! attribute soup) from the runtime entry point. Visibility is `pub(crate)`
@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser)]
-#[command(name = "aioncore", about = "AionUi Backend Server", version)]
+#[command(name = "zigocore", about = "ZigoCore Backend Server", version)]
 pub(crate) struct Cli {
     /// Host address to listen on.
     #[arg(long, default_value_t = String::from(aionui_common::constants::DEFAULT_HOST))]
@@ -155,7 +155,7 @@ pub(crate) enum DiagnoseCommand {
     Cron(DiagnoseCronArgs),
     /// Inspect team summary.
     Teams(DiagnoseTeamsArgs),
-    /// Read aioncore logs.
+    /// Read ZigoCore backend logs.
     Logs(DiagnoseLogsArgs),
     /// Controlled HTTP read escape hatch.
     Http(DiagnoseHttpArgs),
@@ -294,6 +294,7 @@ pub(crate) struct ConfigSkillsArgs {
 #[derive(Subcommand, Debug, Clone)]
 pub(crate) enum ConfigSkillsCommand {
     List,
+    Create,
     Info,
     Paths,
     Import,
@@ -550,7 +551,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let rendered = err.to_string();
         assert!(
-            rendered.contains("aioncore"),
+            rendered.contains("zigocore"),
             "version output should contain binary name, got: {rendered:?}"
         );
         assert!(
@@ -571,7 +572,7 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::DisplayVersion);
         let rendered = err.to_string();
         assert!(
-            rendered.contains("aioncore"),
+            rendered.contains("zigocore"),
             "version output should contain binary name, got: {rendered:?}"
         );
         assert!(

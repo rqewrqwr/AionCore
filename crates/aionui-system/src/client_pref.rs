@@ -23,9 +23,18 @@ impl ClientPrefService {
 
     /// Get all client preferences, or only the specified keys.
     pub async fn get_preferences(&self, keys: Option<&[&str]>) -> Result<ClientPreferencesResponse, SystemError> {
+        self.get_preferences_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, keys)
+            .await
+    }
+
+    pub async fn get_preferences_for_user(
+        &self,
+        user_id: &str,
+        keys: Option<&[&str]>,
+    ) -> Result<ClientPreferencesResponse, SystemError> {
         let rows = match keys {
-            Some(k) if !k.is_empty() => self.repo.get_by_keys(k).await,
-            _ => self.repo.get_all().await,
+            Some(k) if !k.is_empty() => self.repo.get_by_keys_for_user(user_id, k).await,
+            _ => self.repo.get_all_for_user(user_id).await,
         }
         .map_err(|e| SystemError::Internal(format!("Failed to get preferences: {e}")))?;
 
@@ -60,6 +69,15 @@ impl ClientPrefService {
 
     /// Batch update client preferences. Null values delete the key.
     pub async fn update_preferences(&self, req: UpdateClientPreferencesRequest) -> Result<(), SystemError> {
+        self.update_preferences_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, req)
+            .await
+    }
+
+    pub async fn update_preferences_for_user(
+        &self,
+        user_id: &str,
+        req: UpdateClientPreferencesRequest,
+    ) -> Result<(), SystemError> {
         let mut upserts: Vec<(String, String)> = Vec::new();
         let mut deletes: Vec<String> = Vec::new();
 
@@ -94,7 +112,7 @@ impl ClientPrefService {
         if !upserts.is_empty() {
             let entries: Vec<(&str, &str)> = upserts.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
             self.repo
-                .upsert_batch(&entries)
+                .upsert_batch_for_user(user_id, &entries)
                 .await
                 .map_err(|e| SystemError::Internal(format!("Failed to upsert preferences: {e}")))?;
         }
@@ -102,7 +120,7 @@ impl ClientPrefService {
         if !deletes.is_empty() {
             let keys: Vec<&str> = deletes.iter().map(|k| k.as_str()).collect();
             self.repo
-                .delete_keys(&keys)
+                .delete_keys_for_user(user_id, &keys)
                 .await
                 .map_err(|e| SystemError::Internal(format!("Failed to delete preferences: {e}")))?;
         }

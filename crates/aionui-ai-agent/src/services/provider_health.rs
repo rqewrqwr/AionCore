@@ -357,6 +357,7 @@ mod tests {
     fn test_provider() -> Provider {
         Provider {
             id: "provider-1".to_owned(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             platform: "anthropic".to_owned(),
             name: "Test Anthropic".to_owned(),
             base_url: "https://api.anthropic.com".to_owned(),

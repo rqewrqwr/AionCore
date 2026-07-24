@@ -411,6 +411,7 @@ dependencies = [
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
+ "aionui-workspace",
  "anyhow",
  "async-trait",
  "axum",
@@ -567,6 +568,7 @@ dependencies = [
  "aionui-mcp",
  "aionui-realtime",
  "aionui-runtime",
+ "aionui-workspace",
  "async-trait",
  "axum",
  "base64",
@@ -615,8 +617,10 @@ dependencies = [
  "aionui-common",
  "async-trait",
  "fs2",
+ "hex",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx",
  "tempfile",
  "thiserror 2.0.18",
@@ -629,6 +633,7 @@ name = "aionui-extension"
 version = "0.1.47"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
@@ -661,7 +666,9 @@ name = "aionui-file"
 version = "0.1.47"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
+ "aionui-db",
  "aionui-realtime",
  "async-trait",
  "axum",
@@ -689,6 +696,7 @@ name = "aionui-mcp"
 version = "0.1.47"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-db",
  "aionui-realtime",
@@ -718,6 +726,7 @@ dependencies = [
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
+ "aionui-db",
  "aionui-file",
  "aionui-realtime",
  "aionui-runtime",
@@ -784,6 +793,7 @@ name = "aionui-shell"
 version = "0.1.47"
 dependencies = [
  "aionui-api-types",
+ "aionui-auth",
  "aionui-common",
  "aionui-db",
  "aionui-runtime",
@@ -872,6 +882,23 @@ version = "0.1.47"
 dependencies = [
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aionui-workspace"
+version = "0.1.47"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "axum",
+ "serde",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

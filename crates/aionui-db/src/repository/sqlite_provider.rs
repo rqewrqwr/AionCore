@@ -15,28 +15,8 @@ impl SqliteProviderRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
-}
 
-#[async_trait::async_trait]
-impl IProviderRepository for SqliteProviderRepository {
-    async fn list(&self) -> Result<Vec<Provider>, DbError> {
-        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at ASC")
-            .fetch_all(&self.pool)
-            .await?;
-
-        Ok(rows)
-    }
-
-    async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
-        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn create(&self, params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+    async fn create_owned(&self, owner_user_id: &str, params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
         let id = params
             .id
             .map(String::from)
@@ -45,12 +25,13 @@ impl IProviderRepository for SqliteProviderRepository {
 
         sqlx::query(
             "INSERT INTO providers \
-                (id, platform, name, base_url, api_key_encrypted, models, enabled, \
+                (id, owner_user_id, platform, name, base_url, api_key_encrypted, models, enabled, \
                  capabilities, context_limit, model_protocols, model_enabled, \
                  model_health, bedrock_config, is_full_url, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
+        .bind(owner_user_id)
         .bind(params.platform)
         .bind(params.name)
         .bind(params.base_url)
@@ -77,6 +58,7 @@ impl IProviderRepository for SqliteProviderRepository {
 
         Ok(Provider {
             id,
+            owner_user_id: owner_user_id.to_owned(),
             platform: params.platform.to_string(),
             name: params.name.to_string(),
             base_url: params.base_url.to_string(),
@@ -93,6 +75,55 @@ impl IProviderRepository for SqliteProviderRepository {
             created_at: now,
             updated_at: now,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl IProviderRepository for SqliteProviderRepository {
+    async fn list(&self) -> Result<Vec<Provider>, DbError> {
+        let rows = sqlx::query_as::<_, Provider>("SELECT * FROM providers ORDER BY created_at ASC")
+            .fetch_all(&self.pool)
+            .await?;
+
+        Ok(rows)
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<Provider>, DbError> {
+        let rows = sqlx::query_as::<_, Provider>(
+            "SELECT * FROM providers WHERE owner_user_id IN (?, ?) ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn find_by_id(&self, id: &str) -> Result<Option<Provider>, DbError> {
+        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<Provider>, DbError> {
+        let row = sqlx::query_as::<_, Provider>("SELECT * FROM providers WHERE id = ? AND owner_user_id IN (?, ?)")
+            .bind(id)
+            .bind(user_id)
+            .bind(crate::SHARED_RESOURCE_OWNER)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(row)
+    }
+
+    async fn create(&self, params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+        self.create_owned(crate::DEFAULT_RESOURCE_OWNER, params).await
+    }
+
+    async fn create_for_user(&self, user_id: &str, params: CreateProviderParams<'_>) -> Result<Provider, DbError> {
+        self.create_owned(user_id, params).await
     }
 
     async fn update(&self, id: &str, params: UpdateProviderParams<'_>) -> Result<Provider, DbError> {
@@ -156,6 +187,7 @@ fn merge_update(existing: Provider, params: UpdateProviderParams<'_>) -> Provide
     let now = aionui_common::now_ms();
     Provider {
         id: existing.id,
+        owner_user_id: existing.owner_user_id,
         platform: params.platform.unwrap_or(&existing.platform).to_string(),
         name: params.name.unwrap_or(&existing.name).to_string(),
         base_url: params.base_url.unwrap_or(&existing.base_url).to_string(),
@@ -287,6 +319,17 @@ mod tests {
         assert_eq!(found.id, created.id);
         assert_eq!(found.platform, "anthropic");
         assert_eq!(found.models, r#"["claude-sonnet-4-20250514"]"#);
+    }
+
+    #[tokio::test]
+    async fn user_scoped_provider_access_denies_other_users() {
+        let (repo, _db) = setup().await;
+        let created = repo.create_for_user("user-a", sample_params()).await.unwrap();
+
+        assert!(repo.find_by_id_for_user("user-a", &created.id).await.unwrap().is_some());
+        assert!(repo.find_by_id_for_user("user-b", &created.id).await.unwrap().is_none());
+        assert_eq!(repo.list_for_user("user-a").await.unwrap().len(), 1);
+        assert!(repo.list_for_user("user-b").await.unwrap().is_empty());
     }
 
     #[tokio::test]

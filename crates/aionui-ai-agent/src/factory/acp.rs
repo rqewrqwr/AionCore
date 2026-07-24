@@ -78,6 +78,7 @@ pub(super) async fn build(
         Some(repo) => {
             load_user_mcp_servers(
                 repo.as_ref(),
+                &ctx.user_id,
                 config.mcp_server_ids.as_deref(),
                 &ctx.conversation_id,
                 &mcp_capabilities,
@@ -114,6 +115,7 @@ pub(super) async fn build(
     let params = Arc::new(
         assemble_acp_params(
             ctx.conversation_id.clone(),
+            ctx.user_id.clone(),
             WorkspaceInfo {
                 path: ctx.workspace,
                 is_custom: ctx.is_custom_workspace,
@@ -284,13 +286,14 @@ async fn resolve_builtin_managed_acp_command_spec(
 /// Builtins are wired through other paths (e.g. team/guide MCP).
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
+    user_id: &str,
     selected_ids: Option<&[String]>,
     conversation_id: &str,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
     let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(ids).await,
-        None => repo.list().await,
+        Some(ids) => repo.list_by_ids_for_user(user_id, ids).await,
+        None => repo.list_for_user(user_id).await,
     };
     let rows = match rows_result {
         Ok(r) => r,
@@ -522,6 +525,7 @@ mod tests {
     ) -> McpServerRow {
         McpServerRow {
             id: format!("mcp_{name}"),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: name.to_owned(),
             description: None,
             enabled,
@@ -904,7 +908,8 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers =
+            load_user_mcp_servers(repo.as_ref(), aionui_db::DEFAULT_RESOURCE_OWNER, None, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
@@ -923,7 +928,8 @@ mod tests {
             rows: vec![],
             fail: true,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers =
+            load_user_mcp_servers(repo.as_ref(), aionui_db::DEFAULT_RESOURCE_OWNER, None, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 
@@ -942,7 +948,8 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers =
+            load_user_mcp_servers(repo.as_ref(), aionui_db::DEFAULT_RESOURCE_OWNER, None, "conv-1", &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "good"),
@@ -967,7 +974,14 @@ mod tests {
         });
 
         let selected = vec!["mcp_disabled-picked".to_owned()];
-        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(
+            repo.as_ref(),
+            aionui_db::DEFAULT_RESOURCE_OWNER,
+            Some(&selected),
+            "conv-1",
+            &caps,
+        )
+        .await;
 
         assert_eq!(servers.len(), 1);
         match &servers[0] {
@@ -994,7 +1008,8 @@ mod tests {
             fail: false,
         });
 
-        let servers = load_user_mcp_servers(repo.as_ref(), None, "conv-1", &caps).await;
+        let servers =
+            load_user_mcp_servers(repo.as_ref(), aionui_db::DEFAULT_RESOURCE_OWNER, None, "conv-1", &caps).await;
         assert!(servers.is_empty());
     }
 }

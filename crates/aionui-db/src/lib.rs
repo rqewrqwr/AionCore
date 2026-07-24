@@ -22,7 +22,7 @@ pub use models::{
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
     SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
     UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
-    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams,
+    UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, WorkspaceRow,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
@@ -36,7 +36,9 @@ pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
-pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
+pub use repository::skill::{
+    CreateSkillImportRecordParams, DEFAULT_SKILL_OWNER, SHARED_SKILL_OWNER, UpsertSkillParams,
+};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
     CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
@@ -45,14 +47,26 @@ pub use repository::{
     IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository, IClientPreferenceRepository,
     IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository, IMcpServerRepository,
     IOAuthTokenRepository, IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISkillRepository,
-    ITeamRepository, IUserRepository, PersistedSessionState, SaveRuntimeStateParams, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
+    ITeamRepository, IUserRepository, IWorkspaceRepository, PersistedSessionState, SaveRuntimeStateParams,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
     SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteUserRepository,
+    SqliteTeamRepository, SqliteUserRepository, SqliteWorkspaceRepository,
 };
 
 // Re-export sqlx pool type for downstream crates
 pub use sqlx::SqlitePool;
+
+/// Owner used by trusted single-user/local mode and legacy rows.
+pub const DEFAULT_RESOURCE_OWNER: &str = "system_default_user";
+/// Owner marker for built-in resources readable by every authenticated user.
+pub const SHARED_RESOURCE_OWNER: &str = "__shared__";
+
+/// Stable, non-reversible subject key used by the enterprise ownership table.
+pub fn resource_owner_subject(user_id: &str) -> String {
+    use sha2::{Digest, Sha256};
+
+    hex::encode(Sha256::digest(user_id.as_bytes()))[..24].to_owned()
+}

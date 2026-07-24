@@ -18,87 +18,25 @@ impl SqliteMcpServerRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
-}
 
-#[async_trait::async_trait]
-impl IMcpServerRepository for SqliteMcpServerRepository {
-    async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
-        let rows = sqlx::query_as::<_, McpServerRow>(
-            "SELECT * FROM mcp_servers WHERE deleted_at IS NULL ORDER BY created_at ASC",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-
-        Ok(rows)
-    }
-
-    async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ? AND deleted_at IS NULL")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE name = ? AND deleted_at IS NULL")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
-        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE name = ?")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-
-        Ok(row)
-    }
-
-    async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
-        if ids.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        let mut query = QueryBuilder::new("SELECT * FROM mcp_servers WHERE id IN (");
-        let mut separated = query.separated(", ");
-        for id in ids {
-            separated.push_bind(id);
-        }
-        separated.push_unseparated(") ORDER BY created_at ASC");
-
-        let rows = query.build_query_as::<McpServerRow>().fetch_all(&self.pool).await?;
-        let rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
-
-        Ok(ids.iter().filter_map(|id| rows_by_id.get(id).cloned()).collect())
-    }
-
-    async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+    async fn create_owned(
+        &self,
+        owner_user_id: &str,
+        params: CreateMcpServerParams<'_>,
+    ) -> Result<McpServerRow, DbError> {
         let id = aionui_common::generate_prefixed_id("mcp");
         let now = aionui_common::now_ms();
         let last_test_status = "disconnected";
 
         sqlx::query(
             "INSERT INTO mcp_servers \
-                (id, name, description, enabled, transport_type, transport_config, \
+                (id, owner_user_id, name, description, enabled, transport_type, transport_config, \
                  tools, last_test_status, last_connected, original_json, builtin, \
                  deleted_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&id)
+        .bind(owner_user_id)
         .bind(params.name)
         .bind(params.description)
         .bind(params.enabled)
@@ -123,6 +61,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
 
         Ok(McpServerRow {
             id,
+            owner_user_id: owner_user_id.to_owned(),
             name: params.name.to_string(),
             description: params.description.map(String::from),
             enabled: params.enabled,
@@ -137,6 +76,155 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             created_at: now,
             updated_at: now,
         })
+    }
+}
+
+#[async_trait::async_trait]
+impl IMcpServerRepository for SqliteMcpServerRepository {
+    async fn list(&self) -> Result<Vec<McpServerRow>, DbError> {
+        let rows = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE deleted_at IS NULL ORDER BY created_at ASC",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<McpServerRow>, DbError> {
+        let rows = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE deleted_at IS NULL AND owner_user_id IN (?, ?) ORDER BY created_at ASC",
+        )
+        .bind(user_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn find_by_id(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ? AND deleted_at IS NULL")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE id = ? AND deleted_at IS NULL AND owner_user_id IN (?, ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn find_by_name(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE name = ? AND deleted_at IS NULL ORDER BY builtin DESC, created_at ASC LIMIT 1",
+        )
+            .bind(name)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_name_for_user(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE name = ? AND deleted_at IS NULL AND owner_user_id IN (?, ?) ORDER BY builtin DESC LIMIT 1",
+        )
+        .bind(name)
+        .bind(user_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn find_by_id_any(&self, id: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>("SELECT * FROM mcp_servers WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_name_any(&self, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE name = ? ORDER BY builtin DESC, created_at ASC LIMIT 1",
+        )
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    async fn find_by_name_any_for_user(&self, user_id: &str, name: &str) -> Result<Option<McpServerRow>, DbError> {
+        let row = sqlx::query_as::<_, McpServerRow>(
+            "SELECT * FROM mcp_servers WHERE name = ? AND owner_user_id IN (?, ?) ORDER BY builtin DESC LIMIT 1",
+        )
+        .bind(name)
+        .bind(user_id)
+        .bind(crate::SHARED_RESOURCE_OWNER)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn list_by_ids_any(&self, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut query = QueryBuilder::new("SELECT * FROM mcp_servers WHERE id IN (");
+        let mut separated = query.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(") ORDER BY created_at ASC");
+
+        let rows = query.build_query_as::<McpServerRow>().fetch_all(&self.pool).await?;
+        let rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+
+        Ok(ids.iter().filter_map(|id| rows_by_id.get(id).cloned()).collect())
+    }
+
+    async fn list_by_ids_for_user(&self, user_id: &str, ids: &[String]) -> Result<Vec<McpServerRow>, DbError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::new("SELECT * FROM mcp_servers WHERE id IN (");
+        {
+            let mut separated = query.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+        }
+        query.push(") AND owner_user_id IN (");
+        {
+            let mut separated = query.separated(", ");
+            separated.push_bind(user_id);
+            separated.push_bind(crate::SHARED_RESOURCE_OWNER);
+        }
+        query.push(") ORDER BY created_at ASC");
+        let rows = query.build_query_as::<McpServerRow>().fetch_all(&self.pool).await?;
+        let rows_by_id: HashMap<_, _> = rows.into_iter().map(|row| (row.id.clone(), row)).collect();
+        Ok(ids.iter().filter_map(|id| rows_by_id.get(id).cloned()).collect())
+    }
+
+    async fn create(&self, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        self.create_owned(crate::DEFAULT_RESOURCE_OWNER, params).await
+    }
+
+    async fn create_for_user(&self, user_id: &str, params: CreateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
+        self.create_owned(user_id, params).await
     }
 
     async fn update(&self, id: &str, params: UpdateMcpServerParams<'_>) -> Result<McpServerRow, DbError> {
@@ -267,6 +355,7 @@ fn merge_update(existing: McpServerRow, params: UpdateMcpServerParams<'_>) -> Mc
     let now = aionui_common::now_ms();
     McpServerRow {
         id: existing.id,
+        owner_user_id: existing.owner_user_id,
         name: params.name.unwrap_or(&existing.name).to_string(),
         description: params.description.map_or(existing.description, |v| v.map(String::from)),
         enabled: params.enabled.unwrap_or(existing.enabled),
@@ -363,6 +452,32 @@ mod tests {
 
         let err = repo.create(stdio_params()).await.unwrap_err();
         assert!(matches!(err, DbError::Conflict(_)));
+    }
+
+    #[tokio::test]
+    async fn users_can_reuse_names_without_cross_user_access() {
+        let (repo, _db) = setup().await;
+        let a = repo.create_for_user("user-a", stdio_params()).await.unwrap();
+        let b = repo.create_for_user("user-b", stdio_params()).await.unwrap();
+
+        assert_ne!(a.id, b.id);
+        assert_eq!(
+            repo.find_by_name_for_user("user-a", "test-mcp")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            a.id
+        );
+        assert_eq!(
+            repo.find_by_name_for_user("user-b", "test-mcp")
+                .await
+                .unwrap()
+                .unwrap()
+                .id,
+            b.id
+        );
+        assert!(repo.find_by_id_for_user("user-b", &a.id).await.unwrap().is_none());
     }
 
     #[tokio::test]

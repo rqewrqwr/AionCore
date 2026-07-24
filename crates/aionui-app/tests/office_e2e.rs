@@ -102,6 +102,10 @@ fn build_test_office_state(data_dir: &std::path::Path, allowed_roots: Vec<std::p
         conversion_service: conversion,
         proxy_service: proxy,
         allowed_roots,
+        conversation_repo: None,
+        local_mode: true,
+        preview_port_owners: Default::default(),
+        preview_path_owners: Default::default(),
     }
 }
 

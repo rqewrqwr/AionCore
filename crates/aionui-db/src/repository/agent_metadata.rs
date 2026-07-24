@@ -17,8 +17,26 @@ pub trait IAgentMetadataRepository: Send + Sync {
     /// Return every row, in insertion order.
     async fn list_all(&self) -> Result<Vec<AgentMetadataRow>, DbError>;
 
+    /// Return the catalog visible to one user. Shared agent definitions remain
+    /// visible; custom definitions require an ownership record.
+    async fn list_all_for_user(&self, user_id: &str) -> Result<Vec<AgentMetadataRow>, DbError> {
+        let _ = user_id;
+        self.list_all().await
+    }
+
     /// Look up by primary key.
     async fn get(&self, id: &str) -> Result<Option<AgentMetadataRow>, DbError>;
+
+    /// User-scoped lookup used at API and runtime trust boundaries.
+    async fn get_for_user(&self, user_id: &str, id: &str) -> Result<Option<AgentMetadataRow>, DbError> {
+        let _ = user_id;
+        self.get(id).await
+    }
+
+    /// Persist ownership for a newly-created custom agent.
+    async fn assign_to_user(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
 
     /// Look up by the unique `(agent_source, name)` pair.
     async fn find_by_source_and_name(

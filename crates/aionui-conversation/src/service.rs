@@ -8,6 +8,7 @@ use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
 };
+use aionui_auth::JwtService;
 
 use crate::message_cursor::{decode_message_cursor, encode_message_cursor};
 use crate::runtime_completion::RuntimeCompletionPublisher;
@@ -39,6 +40,7 @@ use aionui_extension::AssistantRuleDispatcher;
 use aionui_mcp::{AcpMcpCapabilities, parse_acp_mcp_capabilities};
 use aionui_realtime::EventBroadcaster;
 use aionui_runtime::{RuntimeCommandProbe, probe_node_runtime_supported, probe_runtime_command, resolve_command_path};
+use aionui_workspace::WorkspaceAccessPort;
 use chrono::Datelike;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
@@ -317,9 +319,12 @@ pub struct ConversationService {
     assistant_preference_repo: Arc<RwLock<Option<Arc<dyn IAssistantPreferenceRepository>>>>,
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
+    workspace_access: Arc<RwLock<Option<Arc<dyn WorkspaceAccessPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
+    runtime_jwt_service: Option<Arc<JwtService>>,
+    runtime_private_gateway_url: Option<String>,
 
     // Repos for conversation, acp_session and agent_metadata access.
     conversation_repo: Arc<dyn IConversationRepository>,
@@ -389,9 +394,12 @@ impl ConversationService {
             assistant_preference_repo: Arc::new(RwLock::new(None)),
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
+            workspace_access: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
+            runtime_jwt_service: None,
+            runtime_private_gateway_url: None,
 
             conversation_repo,
             agent_metadata_repo,
@@ -407,6 +415,16 @@ impl ConversationService {
     pub fn with_runtime_helper_context(mut self, helper_bin: String, base_url: String) -> Self {
         self.runtime_helper_bin = Some(helper_bin);
         self.runtime_base_url = Some(base_url);
+        self
+    }
+
+    pub fn with_runtime_auth_context(
+        mut self,
+        jwt_service: Arc<JwtService>,
+        private_gateway_url: Option<String>,
+    ) -> Self {
+        self.runtime_jwt_service = Some(jwt_service);
+        self.runtime_private_gateway_url = private_gateway_url;
         self
     }
 
@@ -450,6 +468,12 @@ impl ConversationService {
     pub fn with_agent_availability_feedback(&self, feedback: Arc<dyn AgentAvailabilityFeedbackPort>) {
         if let Ok(mut guard) = self.agent_availability_feedback.write() {
             *guard = Some(feedback);
+        }
+    }
+
+    pub fn with_workspace_access(&self, workspace_access: Arc<dyn WorkspaceAccessPort>) {
+        if let Ok(mut guard) = self.workspace_access.write() {
+            *guard = Some(workspace_access);
         }
     }
 
@@ -536,6 +560,13 @@ impl ConversationService {
 
     pub(crate) fn agent_availability_feedback(&self) -> Option<Arc<dyn AgentAvailabilityFeedbackPort>> {
         self.agent_availability_feedback
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().cloned())
+    }
+
+    fn workspace_access(&self) -> Option<Arc<dyn WorkspaceAccessPort>> {
+        self.workspace_access
             .read()
             .ok()
             .and_then(|guard| guard.as_ref().cloned())
@@ -709,13 +740,34 @@ impl ConversationService {
             .unwrap_or_default();
         let assistant_snapshot = match assistant_id.as_deref() {
             Some(id) => {
-                self.resolve_assistant_snapshot(id, assistant_locale.as_deref(), &assistant_overrides, &extra)
+                self.resolve_assistant_snapshot(user_id, id, assistant_locale.as_deref(), &assistant_overrides, &extra)
                     .await?
             }
             None => None,
         };
         let explicit_type = req.r#type;
         let effective_type = resolve_create_agent_type(explicit_type, assistant_snapshot.as_ref())?;
+
+        if effective_type == AgentType::Acp {
+            let requested_agent_id = assistant_snapshot
+                .as_ref()
+                .map(|snapshot| snapshot.agent_id.as_str())
+                .filter(|id| !id.is_empty())
+                .or_else(|| extra.get("agent_id").and_then(serde_json::Value::as_str))
+                .filter(|id| !id.is_empty());
+            if let Some(agent_id) = requested_agent_id
+                && self
+                    .agent_metadata_repo
+                    .get_for_user(user_id, agent_id)
+                    .await
+                    .map_err(|e| ConversationError::internal(format!("agent_metadata access check failed: {e}")))?
+                    .is_none()
+            {
+                return Err(ConversationError::BadRequest {
+                    reason: format!("agent `{agent_id}` is unavailable for the current user"),
+                });
+            }
+        }
 
         if !effective_type.supports_new_conversation() {
             info!(
@@ -751,22 +803,15 @@ impl ConversationService {
             warn!("aionrs create: stripped legacy `extra.model`; top-level `model` is canonical");
         }
 
-        // Determine whether the user chose this workspace ("custom") or we
-        // auto-provision one under
-        // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
-        // Skill wiring runs for both kinds so native CLI discovery behaves
-        // consistently.
-        let user_supplied_workspace = match extra
+        // Resolve a user-selected workspace or provision a private managed
+        // server workspace. The legacy path-only branch remains available to
+        // tests and embedders that construct ConversationService without the
+        // workspace domain port.
+        let requested_workspace = extra
             .get("workspace")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-        {
-            Some(workspace) => Some(normalize_workspace_path(workspace)?),
-            None => None,
-        };
-        if let Some(workspace) = user_supplied_workspace.as_ref() {
-            extra["workspace"] = serde_json::Value::String(workspace.clone());
-        }
+            .map(str::to_owned);
 
         let assistant_backend = assistant_snapshot
             .as_ref()
@@ -780,26 +825,57 @@ impl ConversationService {
                 .map(str::to_owned)
         });
 
-        let auto_provisioned_workspace = if user_supplied_workspace.is_none() {
-            // Per-conversation temp workspaces live under
-            // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
-            // The label lets operators eyeball the agent type; the
-            // conversation id keeps the mapping back to the DB row unique.
-            let label = conversation_label(
-                &effective_type,
-                effective_backend
-                    .as_ref()
-                    .map(|backend| serde_json::Value::String(backend.clone()))
-                    .as_ref(),
-            );
-            let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("{label}-temp-{id}"));
-            std::fs::create_dir_all(&ws_path)
-                .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
-            extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
-            Some(ws_path)
-        } else {
-            None
-        };
+        let mut managed_workspace_id = None;
+        let (user_supplied_workspace, auto_provisioned_workspace) =
+            if let Some(workspace_access) = self.workspace_access() {
+                let workspace = workspace_access
+                    .prepare_conversation_workspace(
+                        user_id,
+                        &id,
+                        req.name.as_deref().unwrap_or("Workspace"),
+                        requested_workspace.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| match error {
+                        aionui_workspace::WorkspaceError::NotFound | aionui_workspace::WorkspaceError::Forbidden => {
+                            ConversationError::NotFoundReason {
+                                reason: "Workspace not found".to_owned(),
+                            }
+                        }
+                        aionui_workspace::WorkspaceError::Invalid(reason) => ConversationError::BadRequest { reason },
+                        other => ConversationError::internal(format!("Failed to prepare workspace: {other}")),
+                    })?;
+                let workspace_path = workspace.root_path.to_string_lossy().into_owned();
+                extra["workspace"] = serde_json::Value::String(workspace_path.clone());
+                extra["workspace_id"] = serde_json::Value::String(workspace.id.clone());
+                managed_workspace_id = Some(workspace.id);
+                if requested_workspace.is_some() {
+                    (Some(workspace_path), None)
+                } else {
+                    (None, Some(workspace.root_path))
+                }
+            } else if requested_workspace.is_none() {
+                // Per-conversation temp workspaces live under
+                // `{data_dir}/conversations/YYYY/MM/DD/{label}-temp-{id}/`.
+                // The label lets operators eyeball the agent type; the
+                // conversation id keeps the mapping back to the DB row unique.
+                let label = conversation_label(
+                    &effective_type,
+                    effective_backend
+                        .as_ref()
+                        .map(|backend| serde_json::Value::String(backend.clone()))
+                        .as_ref(),
+                );
+                let ws_path = auto_workspace_parent(&self.workspace_root).join(format!("{label}-temp-{id}"));
+                std::fs::create_dir_all(&ws_path)
+                    .map_err(|e| ConversationError::internal(format!("Failed to create workspace: {e}")))?;
+                extra["workspace"] = serde_json::Value::String(ws_path.to_string_lossy().into_owned());
+                (None, Some(ws_path))
+            } else {
+                let workspace = normalize_workspace_path(requested_workspace.as_deref().unwrap_or_default())?;
+                extra["workspace"] = serde_json::Value::String(workspace.clone());
+                (Some(workspace), None)
+            };
 
         // Strip the request-only custom_workspace toggle — it was read above
         // and must not be persisted as an extra field.
@@ -953,7 +1029,10 @@ impl ConversationService {
             )
             .await
         {
-            let resolved = self.skill_resolver.resolve_skills(&initial_skills).await;
+            let resolved = self
+                .skill_resolver
+                .resolve_skills_for_user(user_id, &initial_skills)
+                .await;
             if !resolved.is_empty() {
                 let rel_dirs_refs: Vec<&str> = rel_dirs.iter().map(String::as_str).collect();
                 let n = self
@@ -1107,6 +1186,15 @@ impl ConversationService {
         };
 
         self.conversation_repo.create(&row).await?;
+        if let (Some(workspace_access), Some(workspace_id)) = (self.workspace_access(), managed_workspace_id.as_deref())
+        {
+            workspace_access
+                .bind_conversation(user_id, &row.id, workspace_id)
+                .await
+                .map_err(|error| {
+                    ConversationError::internal(format!("Failed to bind conversation workspace: {error}"))
+                })?;
+        }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {
             let resolved_skill_ids = serde_json::to_string(&snapshot.resolved_defaults.skill_ids).map_err(|e| {
@@ -1282,8 +1370,22 @@ impl ConversationService {
         Ok(resolve_agent_binding_from_rows(&rows, value))
     }
 
+    async fn resolve_assistant_agent_binding_for_user(
+        &self,
+        user_id: &str,
+        value: &str,
+    ) -> Result<Option<AgentBindingResolution>, ConversationError> {
+        let rows = self
+            .agent_metadata_repo
+            .list_all_for_user(user_id)
+            .await
+            .map_err(|e| ConversationError::internal(format!("agent_metadata lookup failed: {e}")))?;
+        Ok(resolve_agent_binding_from_rows(&rows, value))
+    }
+
     async fn resolve_assistant_snapshot(
         &self,
+        user_id: &str,
         assistant_id: &str,
         locale: Option<&str>,
         overrides: &AssistantConversationOverrides,
@@ -1298,7 +1400,7 @@ impl ConversationService {
         };
 
         let Some(definition) = definition_repo
-            .get_by_assistant_id(assistant_id)
+            .get_by_assistant_id_for_user(user_id, assistant_id)
             .await
             .map_err(|e| ConversationError::internal(format!("assistant definition lookup failed: {e}")))?
         else {
@@ -1398,7 +1500,7 @@ impl ConversationService {
             .and_then(|row| row.agent_id_override.clone())
             .unwrap_or_else(|| definition.agent_id.clone());
         let agent_binding = self
-            .resolve_assistant_agent_binding(&effective_agent_id)
+            .resolve_assistant_agent_binding_for_user(user_id, &effective_agent_id)
             .await?
             .ok_or_else(|| ConversationError::BadRequest {
                 reason: format!("assistant agent `{effective_agent_id}` is not registered in agent_metadata"),
@@ -3241,11 +3343,21 @@ impl ConversationService {
         user_id: &str,
         conversation_id: &str,
     ) {
+        let runtime_credential = self.runtime_jwt_service.as_ref().and_then(|service| {
+            service
+                .sign_agent_skill_config_with_renewal(user_id, conversation_id)
+                .ok()
+        });
         build_opts.apply_conversation_runtime_context(
             user_id,
             conversation_id,
             self.runtime_helper_bin.as_deref(),
             self.runtime_base_url.as_deref(),
+            runtime_credential.as_ref().map(|credential| credential.token.as_str()),
+            runtime_credential
+                .as_ref()
+                .map(|credential| credential.renewal_generation),
+            self.runtime_private_gateway_url.as_deref(),
         );
     }
 
@@ -3288,7 +3400,10 @@ impl ConversationService {
             return;
         }
 
-        let resolved = self.skill_resolver.resolve_skills(&skill_names).await;
+        let resolved = self
+            .skill_resolver
+            .resolve_skills_for_user(&row.user_id, &skill_names)
+            .await;
         if resolved.is_empty() {
             return;
         }

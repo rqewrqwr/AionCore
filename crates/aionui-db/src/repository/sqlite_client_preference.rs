@@ -1,5 +1,6 @@
 use sqlx::SqlitePool;
 
+use crate::DEFAULT_RESOURCE_OWNER;
 use crate::error::DbError;
 use crate::models::ClientPreference;
 use crate::repository::IClientPreferenceRepository;
@@ -19,14 +20,25 @@ impl SqliteClientPreferenceRepository {
 #[async_trait::async_trait]
 impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
     async fn get_all(&self) -> Result<Vec<ClientPreference>, DbError> {
-        let rows = sqlx::query_as::<_, ClientPreference>("SELECT * FROM client_preferences ORDER BY key")
-            .fetch_all(&self.pool)
-            .await?;
+        self.get_all_for_user(DEFAULT_RESOURCE_OWNER).await
+    }
+
+    async fn get_all_for_user(&self, user_id: &str) -> Result<Vec<ClientPreference>, DbError> {
+        let rows = sqlx::query_as::<_, ClientPreference>(
+            "SELECT key, value, updated_at FROM client_preferences WHERE owner_user_id = ? ORDER BY key",
+        )
+        .bind(user_id)
+        .fetch_all(&self.pool)
+        .await?;
 
         Ok(rows)
     }
 
     async fn get_by_keys(&self, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
+        self.get_by_keys_for_user(DEFAULT_RESOURCE_OWNER, keys).await
+    }
+
+    async fn get_by_keys_for_user(&self, user_id: &str, keys: &[&str]) -> Result<Vec<ClientPreference>, DbError> {
         if keys.is_empty() {
             return Ok(vec![]);
         }
@@ -34,11 +46,11 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
         // Build dynamic IN clause with positional placeholders
         let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
         let sql = format!(
-            "SELECT * FROM client_preferences WHERE key IN ({}) ORDER BY key",
+            "SELECT key, value, updated_at FROM client_preferences WHERE owner_user_id = ? AND key IN ({}) ORDER BY key",
             placeholders.join(", ")
         );
 
-        let mut query = sqlx::query_as::<_, ClientPreference>(&sql);
+        let mut query = sqlx::query_as::<_, ClientPreference>(&sql).bind(user_id);
         for key in keys {
             query = query.bind(*key);
         }
@@ -48,6 +60,10 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
     }
 
     async fn upsert_batch(&self, entries: &[(&str, &str)]) -> Result<(), DbError> {
+        self.upsert_batch_for_user(DEFAULT_RESOURCE_OWNER, entries).await
+    }
+
+    async fn upsert_batch_for_user(&self, user_id: &str, entries: &[(&str, &str)]) -> Result<(), DbError> {
         if entries.is_empty() {
             return Ok(());
         }
@@ -59,12 +75,13 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
 
         for (key, value) in entries {
             sqlx::query(
-                "INSERT INTO client_preferences (key, value, updated_at) \
-                 VALUES (?, ?, ?) \
-                 ON CONFLICT(key) DO UPDATE SET \
+                "INSERT INTO client_preferences (owner_user_id, key, value, updated_at) \
+                 VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(owner_user_id, key) DO UPDATE SET \
                     value = excluded.value, \
                     updated_at = excluded.updated_at",
             )
+            .bind(user_id)
             .bind(*key)
             .bind(*value)
             .bind(now)
@@ -77,17 +94,21 @@ impl IClientPreferenceRepository for SqliteClientPreferenceRepository {
     }
 
     async fn delete_keys(&self, keys: &[&str]) -> Result<(), DbError> {
+        self.delete_keys_for_user(DEFAULT_RESOURCE_OWNER, keys).await
+    }
+
+    async fn delete_keys_for_user(&self, user_id: &str, keys: &[&str]) -> Result<(), DbError> {
         if keys.is_empty() {
             return Ok(());
         }
 
         let placeholders: Vec<&str> = keys.iter().map(|_| "?").collect();
         let sql = format!(
-            "DELETE FROM client_preferences WHERE key IN ({})",
+            "DELETE FROM client_preferences WHERE owner_user_id = ? AND key IN ({})",
             placeholders.join(", ")
         );
 
-        let mut query = sqlx::query(&sql);
+        let mut query = sqlx::query(&sql).bind(user_id);
         for key in keys {
             query = query.bind(*key);
         }
@@ -128,6 +149,26 @@ mod tests {
         assert_eq!(prefs[0].value, "360");
         assert_eq!(prefs[1].key, "theme");
         assert_eq!(prefs[1].value, "\"dark\"");
+    }
+
+    #[tokio::test]
+    async fn preferences_are_isolated_by_user() {
+        let (repo, _db) = setup().await;
+        repo.upsert_batch_for_user("user-a", &[("theme.activeId", "\"dark\"")])
+            .await
+            .unwrap();
+        repo.upsert_batch_for_user("user-b", &[("theme.activeId", "\"light\"")])
+            .await
+            .unwrap();
+
+        let a = repo.get_by_keys_for_user("user-a", &["theme.activeId"]).await.unwrap();
+        let b = repo.get_by_keys_for_user("user-b", &["theme.activeId"]).await.unwrap();
+        assert_eq!(a[0].value, "\"dark\"");
+        assert_eq!(b[0].value, "\"light\"");
+
+        repo.delete_keys_for_user("user-a", &["theme.activeId"]).await.unwrap();
+        assert!(repo.get_all_for_user("user-a").await.unwrap().is_empty());
+        assert_eq!(repo.get_all_for_user("user-b").await.unwrap().len(), 1);
     }
 
     #[tokio::test]

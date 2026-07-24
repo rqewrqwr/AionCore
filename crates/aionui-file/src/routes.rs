@@ -2,7 +2,7 @@
 
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, Json, Multipart, Query, State};
+use axum::extract::{DefaultBodyLimit, Extension, Json, Multipart, Query, State};
 use axum::routing::{get, post};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -16,8 +16,11 @@ use aionui_api_types::{
     SnapshotCompareResponse, SnapshotDiscardRequest, SnapshotInfoResponse, SnapshotStageRequest,
     SnapshotWorkspaceRequest, WorkspaceFlatFileResponse, WorkspaceOfficeWatchRequest, WriteFileRequest, ZipRequest,
 };
+use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use aionui_common::constants::UPLOAD_MAX_SIZE;
+use aionui_db::{IConversationRepository, IWorkspaceRepository};
+use tracing::warn;
 
 use crate::browse;
 use crate::error::FileError;
@@ -93,12 +96,121 @@ pub struct FileRouterState {
     pub file_service: FileServiceRef,
     pub watch_service: FileWatchServiceRef,
     pub snapshot_service: SnapshotServiceRef,
+    pub conversation_repo: Arc<dyn IConversationRepository>,
+    pub workspace_repo: Arc<dyn IWorkspaceRepository>,
+    pub local_mode: bool,
     pub allowed_roots: Vec<std::path::PathBuf>,
     /// Roots permitted by the shallow `/api/fs/browse` endpoint. This is
     /// typically wider than `allowed_roots` (it includes `cwd`, Windows
     /// drive letters, and `/` on Unix) because the WebUI host-file picker
     /// legitimately needs to reach outside any single workspace.
     pub browse_roots: BrowseRoots,
+}
+
+async fn require_owned_conversation(
+    state: &FileRouterState,
+    user: &CurrentUser,
+    conversation_id: &str,
+) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    let row = state
+        .conversation_repo
+        .get(conversation_id)
+        .await
+        .map_err(|error| ApiError::Internal(format!("Failed to authorize conversation: {error}")))?;
+    if row.is_some_and(|row| row.user_id == user.id) {
+        return Ok(());
+    }
+    warn!(
+        kind = "file",
+        user_id = %user.id,
+        conversation_id,
+        "File operation rejected for non-owner conversation"
+    );
+    Err(ApiError::NotFound("Conversation not found".to_owned()))
+}
+
+async fn require_owned_workspace(state: &FileRouterState, user: &CurrentUser, workspace: &str) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    let workspace = workspace.trim();
+    if workspace.is_empty() {
+        return Err(ApiError::Forbidden(
+            "An owned conversation workspace is required".to_owned(),
+        ));
+    }
+    let owns_registered = state
+        .workspace_repo
+        .find_owned_by_root(&user.id, workspace)
+        .await
+        .map_err(|error| ApiError::Internal(format!("Failed to authorize workspace: {error}")))?
+        .is_some();
+    let owns_legacy = state
+        .conversation_repo
+        .owns_workspace(&user.id, workspace)
+        .await
+        .map_err(|error| ApiError::Internal(format!("Failed to authorize workspace: {error}")))?;
+    if owns_registered || owns_legacy {
+        return Ok(());
+    }
+    warn!(
+        kind = "file",
+        user_id = %user.id,
+        "File operation rejected for non-owner workspace"
+    );
+    Err(ApiError::Forbidden(
+        "Workspace is not owned by the current user".to_owned(),
+    ))
+}
+
+fn require_path_inside_workspace(path: &str, workspace: &str) -> Result<(), ApiError> {
+    let workspace_path = Path::new(workspace);
+    let requested_path = Path::new(path);
+    let candidate = if requested_path.is_absolute() {
+        requested_path.to_path_buf()
+    } else {
+        workspace_path.join(requested_path)
+    };
+    if candidate
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+        || !candidate.starts_with(workspace_path)
+    {
+        return Err(ApiError::Forbidden("Path is outside the owned workspace".to_owned()));
+    }
+
+    let canonical_workspace = workspace_path
+        .canonicalize()
+        .map_err(|_| ApiError::Forbidden("Workspace path is unavailable".to_owned()))?;
+    let mut existing = candidate.as_path();
+    while !existing.exists() {
+        existing = existing
+            .parent()
+            .ok_or_else(|| ApiError::Forbidden("Path is outside the owned workspace".to_owned()))?;
+    }
+    let canonical_existing = existing
+        .canonicalize()
+        .map_err(|_| ApiError::Forbidden("Path is unavailable".to_owned()))?;
+    if !canonical_existing.starts_with(canonical_workspace) {
+        return Err(ApiError::Forbidden("Path is outside the owned workspace".to_owned()));
+    }
+    Ok(())
+}
+
+async fn require_workspace_path(
+    state: &FileRouterState,
+    user: &CurrentUser,
+    workspace: &str,
+    path: &str,
+) -> Result<(), ApiError> {
+    require_owned_workspace(state, user, workspace).await?;
+    if !state.local_mode {
+        require_path_inside_workspace(path, workspace)?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -169,8 +281,15 @@ pub fn file_routes(state: FileRouterState) -> Router {
 /// filesystem I/O.
 async fn browse_directory(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Query(query): Query<BrowseDirectoryQuery>,
 ) -> Result<Json<ApiResponse<BrowseDirectoryResponse>>, ApiError> {
+    if !state.local_mode {
+        warn!(kind = "file", user_id = %user.id, "Host directory browse rejected in multi-user mode");
+        return Err(ApiError::Forbidden(
+            "Host directory browsing is unavailable in multi-user web mode".to_owned(),
+        ));
+    }
     let show_files = matches!(query.show_files.as_deref(), Some("true") | Some("1"));
     let raw_path = query.path.clone();
     let browse_roots = state.browse_roots.clone();
@@ -187,9 +306,11 @@ async fn browse_directory(
 
 async fn get_files_by_dir(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFilesByDirRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<DirOrFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.root, &req.dir).await?;
     let items = state.file_service.get_files_by_dir(&req.dir, &req.root).await?;
     let response: Vec<DirOrFileResponse> = items.into_iter().map(to_dir_or_file_response).collect();
     Ok(Json(ApiResponse::ok(response)))
@@ -197,6 +318,7 @@ async fn get_files_by_dir(
 
 async fn list_workspace_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListWorkspaceFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<WorkspaceFlatFileResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -204,6 +326,7 @@ async fn list_workspace_files(
     if root.is_empty() {
         return Err(ApiError::BadRequest("root is required".to_owned()));
     }
+    require_owned_workspace(&state, &user, root).await?;
     let items = state
         .file_service
         .list_workspace_files_with_extra_root(root, Some(Path::new(root)))
@@ -215,9 +338,17 @@ async fn list_workspace_files(
 
 async fn get_file_metadata(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetFileMetadataRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<FileMetadataResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_path(&state, &user, workspace, &req.path).await?;
+    }
     let meta = state
         .file_service
         .get_file_metadata(&req.path, req.workspace.as_deref().map(Path::new))
@@ -227,9 +358,17 @@ async fn get_file_metadata(
 
 async fn read_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_path(&state, &user, workspace, &req.path).await?;
+    }
     let content = state
         .file_service
         .read_file(&req.path, req.workspace.as_deref().map(Path::new))
@@ -239,9 +378,17 @@ async fn read_file(
 
 async fn read_file_buffer(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ReadFileBufferRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_path(&state, &user, workspace, &req.path).await?;
+    }
     let data = state
         .file_service
         .read_file_buffer(&req.path, req.workspace.as_deref().map(Path::new))
@@ -256,6 +403,7 @@ async fn read_file_buffer(
 
 async fn write_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WriteFileRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -265,6 +413,7 @@ async fn write_file(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_path(&state, &user, &workspace, &req.path).await?;
     let ok = state
         .file_service
         .write_file(&req.path, req.data.as_bytes(), &workspace)
@@ -274,9 +423,18 @@ async fn write_file(
 
 async fn copy_files(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<CopyFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
+    let source_workspace = req.source_root.as_deref().unwrap_or(&req.workspace);
+    require_owned_workspace(&state, &user, source_workspace).await?;
+    if !state.local_mode {
+        for path in &req.file_paths {
+            require_path_inside_workspace(path, source_workspace)?;
+        }
+    }
     let result = state
         .file_service
         .copy_files_to_workspace(&req.file_paths, &req.workspace, req.source_root.as_deref())
@@ -286,6 +444,7 @@ async fn copy_files(
 
 async fn remove_entry(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RemoveEntryRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -295,12 +454,14 @@ async fn remove_entry(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_path(&state, &user, &workspace, &req.path).await?;
     state.file_service.remove_entry(&req.path, &workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn rename_entry(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<RenameRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<RenameResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -310,6 +471,7 @@ async fn rename_entry(
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default()
     });
+    require_workspace_path(&state, &user, &workspace, &req.path).await?;
     let new_path = state
         .file_service
         .rename_entry_with_extra_root(&req.path, &req.new_name, Some(Path::new(&workspace)))
@@ -408,6 +570,7 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
 
 async fn upload_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
@@ -415,6 +578,13 @@ async fn upload_file(
     let file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
+    if !state.local_mode {
+        let conversation_id = fields
+            .conversation_id
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned conversation is required for upload".to_owned()))?;
+        require_owned_conversation(&state, &user, conversation_id).await?;
+    }
 
     let path = state
         .file_service
@@ -425,9 +595,17 @@ async fn upload_file(
 
 async fn get_image_base64(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetImageBase64Request>, JsonRejection>,
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_path(&state, &user, workspace, &req.path).await?;
+    }
     let data_url = state
         .file_service
         .get_image_base64(&req.path, req.workspace.as_deref().map(Path::new))
@@ -446,9 +624,24 @@ async fn fetch_remote_image(
 
 async fn create_zip(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ZipRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<bool>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_path(&state, &user, workspace, &req.path).await?;
+        let source_workspace = req.source_root.as_deref().unwrap_or(workspace);
+        require_owned_workspace(&state, &user, source_workspace).await?;
+        for entry in &req.files {
+            if let Some(file_path) = entry.file_path.as_deref() {
+                require_path_inside_workspace(file_path, source_workspace)?;
+            }
+        }
+    }
     let entries: Vec<ZipEntry> = req.files.into_iter().map(to_zip_entry).collect();
     let ok = state
         .file_service
@@ -478,32 +671,57 @@ async fn cancel_zip(
 
 async fn start_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        warn!(kind = "file", user_id = %user.id, "File watch rejected without an owned workspace context");
+        return Err(ApiError::Forbidden(
+            "File watching requires an owned workspace context in multi-user mode".to_owned(),
+        ));
+    }
     state.watch_service.start_watch(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn stop_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<FileWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    if !state.local_mode {
+        warn!(kind = "file", user_id = %user.id, "File watch stop rejected without an owned workspace context");
+        return Err(ApiError::Forbidden(
+            "File watching requires an owned workspace context in multi-user mode".to_owned(),
+        ));
+    }
     state.watch_service.stop_watch(&req.file_path).await?;
     Ok(Json(ApiResponse::success()))
 }
 
-async fn stop_all_watches(State(state): State<FileRouterState>) -> Result<Json<ApiResponse<()>>, ApiError> {
+async fn stop_all_watches(
+    State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    if !state.local_mode {
+        warn!(kind = "file", user_id = %user.id, "Global file watch stop rejected in multi-user mode");
+        return Err(ApiError::Forbidden(
+            "Global file watch control is unavailable in multi-user mode".to_owned(),
+        ));
+    }
     state.watch_service.stop_all_watches().await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn start_office_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     let allowed_roots: Vec<&Path> = state.allowed_roots.iter().map(std::path::PathBuf::as_path).collect();
     crate::path_safety::validate_path_with_extra_root(&req.workspace, &allowed_roots, Some(Path::new(&req.workspace)))?;
     state.watch_service.start_office_watch(&req.workspace).await?;
@@ -512,9 +730,11 @@ async fn start_office_watch(
 
 async fn stop_office_watch(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<WorkspaceOfficeWatchRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     state.watch_service.stop_office_watch(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -525,36 +745,44 @@ async fn stop_office_watch(
 
 async fn snapshot_init(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     let info = state.snapshot_service.init(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_info(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotInfoResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     let info = state.snapshot_service.get_info(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_snapshot_info_response(info))))
 }
 
 async fn snapshot_compare(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<SnapshotCompareResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     let result = state.snapshot_service.compare(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(to_compare_response(result))))
 }
 
 async fn snapshot_baseline(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotBaselineRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.workspace, &req.file_path).await?;
     let content = state
         .snapshot_service
         .get_baseline_content(&req.workspace, &req.file_path)
@@ -564,9 +792,11 @@ async fn snapshot_baseline(
 
 async fn snapshot_stage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.workspace, &req.file_path).await?;
     state
         .snapshot_service
         .stage_file(&req.workspace, &req.file_path)
@@ -576,18 +806,22 @@ async fn snapshot_stage_file(
 
 async fn snapshot_stage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     state.snapshot_service.stage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_unstage_file(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotStageRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.workspace, &req.file_path).await?;
     state
         .snapshot_service
         .unstage_file(&req.workspace, &req.file_path)
@@ -597,18 +831,22 @@ async fn snapshot_unstage_file(
 
 async fn snapshot_unstage_all(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     state.snapshot_service.unstage_all(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
 
 async fn snapshot_discard(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.workspace, &req.file_path).await?;
     state
         .snapshot_service
         .discard_file(&req.workspace, &req.file_path, req.operation)
@@ -618,9 +856,11 @@ async fn snapshot_discard(
 
 async fn snapshot_reset(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotDiscardRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_workspace_path(&state, &user, &req.workspace, &req.file_path).await?;
     state
         .snapshot_service
         .reset_file(&req.workspace, &req.file_path, req.operation)
@@ -630,18 +870,22 @@ async fn snapshot_reset(
 
 async fn snapshot_branches(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<String>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     let branches = state.snapshot_service.get_branches(&req.workspace).await?;
     Ok(Json(ApiResponse::ok(branches)))
 }
 
 async fn snapshot_dispose(
     State(state): State<FileRouterState>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SnapshotWorkspaceRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_owned_workspace(&state, &user, &req.workspace).await?;
     state.snapshot_service.dispose(&req.workspace).await?;
     Ok(Json(ApiResponse::success()))
 }
@@ -772,6 +1016,22 @@ mod tests {
         assert!(!first.is_empty());
         assert_eq!(first, second);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn owned_workspace_path_check_rejects_parent_traversal() {
+        let root = tempfile::tempdir().expect("workspace");
+        let escaped = root.path().join("..").join("outside.txt");
+
+        assert!(require_path_inside_workspace(&escaped.to_string_lossy(), &root.path().to_string_lossy()).is_err());
+    }
+
+    #[test]
+    fn owned_workspace_path_check_allows_new_descendant() {
+        let root = tempfile::tempdir().expect("workspace");
+        let child = root.path().join("new").join("document.txt");
+
+        assert!(require_path_inside_workspace(&child.to_string_lossy(), &root.path().to_string_lossy()).is_ok());
     }
 
     #[test]

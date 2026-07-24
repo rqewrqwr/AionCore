@@ -9,6 +9,7 @@ aionui-api-types.workspace = true
 aionui-realtime.workspace = true
 aionui-auth.workspace = true
 aionui-file.workspace = true
+aionui-db.workspace = true
 aionui-runtime.workspace = true
 axum.workspace = true
 tokio.workspace = true

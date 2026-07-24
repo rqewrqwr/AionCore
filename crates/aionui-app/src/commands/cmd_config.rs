@@ -1,8 +1,11 @@
 //! `aioncore config` subcommand: agent-facing automation CLI for AionUi config.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::io::{self, Read, Write};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
 use serde_json::{Map, Value, json};
@@ -21,6 +24,8 @@ use crate::commands::config_capabilities;
 const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
+const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
+const ENV_PRIVATE_GATEWAY_URL: &str = "AIONUI_PRIVATE_GATEWAY_URL";
 
 pub async fn run_config(args: ConfigArgs) -> ExitCode {
     match run(args).await {
@@ -290,6 +295,7 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
             let data = request_json(client, &env, Method::GET, "/api/skills", None, command).await?;
             print_envelope(data, meta(None), command)
         }
+        ConfigSkillsCommand::Create => run_skill_create(client).await,
         ConfigSkillsCommand::Info => {
             run_payload_passthrough(
                 client,
@@ -388,6 +394,97 @@ async fn run_skills(client: &reqwest::Client, args: ConfigSkillsArgs) -> Result<
                 .await
             }
         },
+    }
+}
+
+async fn run_skill_create(client: &reqwest::Client) -> Result<(), ConfigError> {
+    let command = "config skills create";
+    let env = ConfigEnv::from_env(command)?;
+    let payload = read_stdin_payload(command)?;
+    let name = required_string_field(&payload, "name", command)?;
+    let description = required_string_field(&payload, "description", command)?;
+    let instructions = required_string_field(&payload, "instructions", command)?;
+    validate_new_skill_name(&name, command)?;
+    if instructions.len() > 256 * 1024 {
+        return Err(ConfigError::new(
+            ConfigErrorCode::PayloadInvalid,
+            command,
+            "skill instructions exceed the 256 KiB limit",
+        )
+        .field("field", "instructions"));
+    }
+
+    let staged = StagedSkill::create(&name, &description, &instructions, command)?;
+    let before = request_json(client, &env, Method::GET, "/api/skills", None, command).await?;
+    let data = request_json(
+        client,
+        &env,
+        Method::POST,
+        "/api/skills/import",
+        Some(json!({ "skill_path": staged.skill_dir.to_string_lossy() })),
+        command,
+    )
+    .await?;
+    let after = request_json(client, &env, Method::GET, "/api/skills", None, command).await?;
+    print_envelope(data, readback_meta(Map::new(), before, after), command)
+}
+
+fn validate_new_skill_name(name: &str, command: &str) -> Result<(), ConfigError> {
+    let portable = name.chars().count() <= 80
+        && name
+            .chars()
+            .all(|character| character.is_alphanumeric() || matches!(character, '-' | '_'));
+    if portable {
+        Ok(())
+    } else {
+        Err(
+            ConfigError::new(ConfigErrorCode::PayloadInvalid, command, "invalid portable skill name")
+                .field("field", "name"),
+        )
+    }
+}
+
+struct StagedSkill {
+    root: PathBuf,
+    skill_dir: PathBuf,
+}
+
+impl StagedSkill {
+    fn create(name: &str, description: &str, instructions: &str, command: &str) -> Result<Self, ConfigError> {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("aionui-config-skill-{}-{nonce}", std::process::id()));
+        let skill_dir = root.join(name);
+        fs::create_dir_all(&skill_dir).map_err(|_| {
+            ConfigError::new(
+                ConfigErrorCode::FilesystemError,
+                command,
+                "failed to create the temporary skill directory",
+            )
+        })?;
+        let manifest = format!(
+            "---\nname: {}\ndescription: {}\n---\n\n{}\n",
+            serde_json::to_string(name).unwrap_or_else(|_| "\"skill\"".to_owned()),
+            serde_json::to_string(description).unwrap_or_else(|_| "\"\"".to_owned()),
+            instructions.trim(),
+        );
+        if fs::write(skill_dir.join("SKILL.md"), manifest).is_err() {
+            let _ = fs::remove_dir_all(&root);
+            return Err(ConfigError::new(
+                ConfigErrorCode::FilesystemError,
+                command,
+                "failed to write the temporary skill manifest",
+            ));
+        }
+        Ok(Self { root, skill_dir })
+    }
+}
+
+impl Drop for StagedSkill {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.root);
     }
 }
 
@@ -1224,6 +1321,8 @@ struct ConfigEnv {
     base_url: String,
     conversation_id: String,
     user_id: String,
+    runtime_token: Option<String>,
+    private_gateway_url: Option<String>,
 }
 
 impl ConfigEnv {
@@ -1232,8 +1331,18 @@ impl ConfigEnv {
             base_url: required_env(command, ENV_BASE_URL)?.trim_end_matches('/').to_owned(),
             conversation_id: required_env(command, ENV_CONVERSATION_ID)?,
             user_id: required_env(command, ENV_USER_ID)?,
+            runtime_token: optional_env(ENV_RUNTIME_TOKEN),
+            private_gateway_url: optional_env(ENV_PRIVATE_GATEWAY_URL)
+                .map(|value| value.trim_end_matches('/').to_owned()),
         })
     }
+}
+
+fn optional_env(name: &'static str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
 }
 
 fn required_env(command: &str, name: &'static str) -> Result<String, ConfigError> {
@@ -1361,14 +1470,34 @@ async fn request_json(
     body: Option<Value>,
     command: &str,
 ) -> Result<Value, ConfigError> {
-    let url = format!("{}{}", env.base_url, path);
+    let use_private_gateway = env.private_gateway_url.is_some() && is_private_asset_config_path(path);
+    let url = if use_private_gateway {
+        env.private_gateway_url.clone().unwrap_or_default()
+    } else {
+        format!("{}{}", env.base_url, path)
+    };
     let method_label = method.as_str().to_owned();
     let mut request = client
-        .request(method, &url)
+        .request(
+            if use_private_gateway {
+                Method::POST
+            } else {
+                method.clone()
+            },
+            &url,
+        )
         .header("content-type", "application/json")
         .header("x-aionui-conversation-id", &env.conversation_id)
         .header("x-aionui-user-id", &env.user_id);
-    if let Some(body) = body {
+    if let Some(token) = &env.runtime_token {
+        request = request.bearer_auth(token);
+    }
+    if use_private_gateway {
+        request = request.json(&json!({
+            "action": "aion-private",
+            "input": { "method": method_label, "path": path, "body": body }
+        }));
+    } else if let Some(body) = body {
         request = request.json(&body);
     }
 
@@ -1450,7 +1579,33 @@ async fn request_json(
             "config CLI backend write/probe succeeded"
         );
     }
+    if use_private_gateway {
+        if value.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok(value.get("data").cloned().unwrap_or(Value::Null));
+        }
+        return Err(ConfigError::new(
+            ConfigErrorCode::HttpStatusError,
+            command,
+            "private asset gateway returned an unsuccessful response",
+        ));
+    }
     extract_api_data(value, command)
+}
+
+fn route_is_or_has_child(path: &str, root: &str) -> bool {
+    path == root || path.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_private_asset_config_path(path: &str) -> bool {
+    [
+        "/api/skills",
+        "/api/assistants",
+        "/api/providers",
+        "/api/mcp",
+        "/api/agents",
+    ]
+    .into_iter()
+    .any(|root| route_is_or_has_child(path, root))
 }
 
 fn extract_api_data(value: Value, command: &str) -> Result<Value, ConfigError> {
@@ -1676,6 +1831,7 @@ enum ConfigErrorCode {
     HttpStatusError,
     ResponseReadFailed,
     ResponseJsonInvalid,
+    FilesystemError,
     StdoutWriteFailed,
 }
 
@@ -1690,6 +1846,7 @@ impl ConfigErrorCode {
             Self::HttpStatusError => "CONFIG_HTTP_STATUS_ERROR",
             Self::ResponseReadFailed => "CONFIG_RESPONSE_READ_FAILED",
             Self::ResponseJsonInvalid => "CONFIG_RESPONSE_JSON_INVALID",
+            Self::FilesystemError => "CONFIG_FILESYSTEM_ERROR",
             Self::StdoutWriteFailed => "CONFIG_STDOUT_WRITE_FAILED",
         }
     }
@@ -1700,7 +1857,9 @@ impl ConfigErrorCode {
                 ExitCode::from(2)
             }
             Self::HttpRequestFailed | Self::HttpStatusError => ExitCode::from(3),
-            Self::ResponseReadFailed | Self::ResponseJsonInvalid | Self::StdoutWriteFailed => ExitCode::from(1),
+            Self::ResponseReadFailed | Self::ResponseJsonInvalid | Self::FilesystemError | Self::StdoutWriteFailed => {
+                ExitCode::from(1)
+            }
         }
     }
 }
@@ -1781,5 +1940,23 @@ mod tests {
     #[test]
     fn path_segments_are_percent_encoded() {
         assert_eq!(encode_path_segment("a/b c"), "a%2Fb%20c");
+    }
+
+    #[test]
+    fn conversation_asset_commands_use_the_private_gateway() {
+        for path in [
+            "/api/assistants",
+            "/api/skills/import",
+            "/api/providers",
+            "/api/mcp/servers",
+            "/api/agents/management",
+        ] {
+            assert!(
+                is_private_asset_config_path(path),
+                "{path} must use the private gateway"
+            );
+        }
+        assert!(!is_private_asset_config_path("/api/settings"));
+        assert!(!is_private_asset_config_path("/api/conversations/conv-1"));
     }
 }

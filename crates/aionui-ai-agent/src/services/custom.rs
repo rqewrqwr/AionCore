@@ -19,6 +19,7 @@ use aionui_api_types::{
     AgentMetadata, CustomAgentUpsertRequest, TryConnectCustomAgentRequest, TryConnectCustomAgentResponse,
 };
 use aionui_common::generate_short_id;
+use aionui_db::DEFAULT_RESOURCE_OWNER;
 use aionui_db::UpsertAgentMetadataParams;
 use tracing::warn;
 
@@ -54,11 +55,20 @@ impl AgentService {
     }
 
     pub async fn create_custom_agent(&self, req: CustomAgentUpsertRequest) -> Result<AgentMetadata, AgentError> {
+        self.create_custom_agent_for_user(DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn create_custom_agent_for_user(
+        &self,
+        user_id: &str,
+        req: CustomAgentUpsertRequest,
+    ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
         probe_or_reject(&req, self.data_dir()).await?;
 
         let id = generate_short_id();
-        self.upsert_custom_row(&id, &req, /* keep_enabled = */ true).await
+        self.upsert_custom_row(user_id, &id, &req, /* keep_enabled = */ true)
+            .await
     }
 
     pub async fn update_custom_agent(
@@ -66,11 +76,20 @@ impl AgentService {
         id: &str,
         req: CustomAgentUpsertRequest,
     ) -> Result<AgentMetadata, AgentError> {
+        self.update_custom_agent_for_user(DEFAULT_RESOURCE_OWNER, id, req).await
+    }
+
+    pub async fn update_custom_agent_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: CustomAgentUpsertRequest,
+    ) -> Result<AgentMetadata, AgentError> {
         validate_upsert(&req)?;
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -82,14 +101,18 @@ impl AgentService {
         probe_or_reject(&req, self.data_dir()).await?;
 
         let keep_enabled = existing.enabled;
-        self.upsert_custom_row(id, &req, keep_enabled).await
+        self.upsert_custom_row(user_id, id, &req, keep_enabled).await
     }
 
     pub async fn delete_custom_agent(&self, id: &str) -> Result<(), AgentError> {
+        self.delete_custom_agent_for_user(DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn delete_custom_agent_for_user(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
         let existing = self
             .registry()
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -114,6 +137,22 @@ impl AgentService {
     }
 
     pub async fn set_agent_enabled(&self, id: &str, enabled: bool) -> Result<AgentMetadata, AgentError> {
+        self.set_agent_enabled_for_user(DEFAULT_RESOURCE_OWNER, id, enabled)
+            .await
+    }
+
+    pub async fn set_agent_enabled_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        enabled: bool,
+    ) -> Result<AgentMetadata, AgentError> {
+        self.registry()
+            .repo_handle()
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
+            .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
         let updated = self
             .registry()
             .repo_handle()
@@ -134,6 +173,7 @@ impl AgentService {
 
     async fn upsert_custom_row(
         &self,
+        user_id: &str,
         id: &str,
         req: &CustomAgentUpsertRequest,
         enabled: bool,
@@ -193,6 +233,11 @@ impl AgentService {
             .upsert(&params)
             .await
             .map_err(|e| AgentError::internal(format!("repo.upsert: {e}")))?;
+        self.registry()
+            .repo_handle()
+            .assign_to_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.assign_to_user: {e}")))?;
 
         self.registry()
             .reload_one(id)

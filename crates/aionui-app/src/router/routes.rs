@@ -34,6 +34,7 @@ use aionui_realtime::{WsHandlerState, ws_upgrade_handler};
 use aionui_shell::shell_routes;
 use aionui_system::{connection_test_routes, system_routes};
 use aionui_team::{TeamSessionService, team_routes};
+use aionui_workspace::workspace_routes;
 
 use crate::services::AppServices;
 
@@ -146,6 +147,10 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         jwt_service: services.jwt_service.clone(),
         user_repo: services.user_repo.clone(),
         local: services.local,
+        private_asset_gateway_secret: std::env::var(aionui_auth::middleware::PRIVATE_ASSET_GATEWAY_SECRET_ENV)
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
     };
 
     // System routes protected by auth middleware
@@ -219,6 +224,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let assistant_authenticated =
         assistant_routes(states.assistant).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    let workspace_authenticated =
+        workspace_routes(states.workspace).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Office proxy routes — exempt from auth (serve iframe content)
     let office_proxy = office_proxy_routes(states.office);
     let public_assets = asset_routes(AssetRouterState::default());
@@ -248,6 +256,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated);
+    let router = router.merge(workspace_authenticated);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]

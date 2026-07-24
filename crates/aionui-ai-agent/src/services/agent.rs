@@ -16,7 +16,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use aionui_api_types::{AgentLogoEntry, AgentManagementRow, ProviderHealthCheckRequest, ProviderHealthCheckResponse};
-use aionui_db::IProviderRepository;
+use aionui_db::{DEFAULT_RESOURCE_OWNER, IProviderRepository};
 use aionui_realtime::EventBroadcaster;
 
 use super::availability::{AgentAvailabilityFeedbackPort, AgentAvailabilityService};
@@ -78,6 +78,25 @@ impl AgentService {
         Ok(self.availability.list_management_rows().await)
     }
 
+    pub async fn list_management_agents_for_user(&self, user_id: &str) -> Result<Vec<AgentManagementRow>, AgentError> {
+        let allowed: std::collections::HashSet<String> = self
+            .registry
+            .repo_handle()
+            .list_all_for_user(user_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.list_all_for_user: {e}")))?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
+        Ok(self
+            .availability
+            .list_management_rows()
+            .await
+            .into_iter()
+            .filter(|row| allowed.contains(&row.id))
+            .collect())
+    }
+
     /// Backend → logo URL catalog for business surfaces.
     ///
     /// Business pages (guid, team, cron, conversation lists) must render
@@ -86,9 +105,25 @@ impl AgentService {
     /// user-disabled or currently-missing ones, so historical conversations
     /// still resolve a logo — down to its `backend` and stored `icon` URL.
     pub async fn list_agent_logos(&self) -> Result<Vec<AgentLogoEntry>, AgentError> {
+        self.list_agent_logos_for_user(DEFAULT_RESOURCE_OWNER).await
+    }
+
+    pub async fn list_agent_logos_for_user(&self, user_id: &str) -> Result<Vec<AgentLogoEntry>, AgentError> {
+        let allowed: std::collections::HashSet<String> = self
+            .registry
+            .repo_handle()
+            .list_all_for_user(user_id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.list_all_for_user: {e}")))?
+            .into_iter()
+            .map(|row| row.id)
+            .collect();
         let mut seen = std::collections::HashSet::new();
         let mut entries = Vec::new();
         for agent in self.registry.list_all_including_hidden().await {
+            if !allowed.contains(&agent.id) {
+                continue;
+            }
             let Some(logo) = agent.icon.filter(|value| !value.is_empty()) else {
                 continue;
             };
@@ -114,6 +149,15 @@ impl AgentService {
         self.availability.run_manual_health_check(id).await
     }
 
+    pub async fn health_check_agent_by_id_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<AgentManagementRow, AgentError> {
+        self.ensure_agent_access(user_id, id).await?;
+        self.health_check_agent_by_id(id).await
+    }
+
     pub async fn provider_health_check(
         &self,
         req: ProviderHealthCheckRequest,
@@ -126,9 +170,18 @@ impl AgentService {
         id: &str,
         req: aionui_api_types::SetAgentOverridesRequest,
     ) -> Result<AgentManagementRow, AgentError> {
+        self.set_agent_overrides_for_user(DEFAULT_RESOURCE_OWNER, id, req).await
+    }
+
+    pub async fn set_agent_overrides_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: aionui_api_types::SetAgentOverridesRequest,
+    ) -> Result<AgentManagementRow, AgentError> {
         let repo = self.registry.repo_handle();
         let row = repo
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -164,10 +217,18 @@ impl AgentService {
     }
 
     pub async fn get_agent_overrides(&self, id: &str) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
+        self.get_agent_overrides_for_user(DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn get_agent_overrides_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::AgentOverridesResponse, AgentError> {
         let row = self
             .registry
             .repo_handle()
-            .get(id)
+            .get_for_user(user_id, id)
             .await
             .map_err(|e| AgentError::internal(format!("repo.get: {e}")))?
             .ok_or_else(|| AgentError::not_found(format!("Agent '{id}' not found")))?;
@@ -186,6 +247,20 @@ impl AgentService {
             },
             env_override,
         })
+    }
+
+    async fn ensure_agent_access(&self, user_id: &str, id: &str) -> Result<(), AgentError> {
+        if self
+            .registry
+            .repo_handle()
+            .get_for_user(user_id, id)
+            .await
+            .map_err(|e| AgentError::internal(format!("repo.get_for_user: {e}")))?
+            .is_none()
+        {
+            return Err(AgentError::not_found(format!("Agent '{id}' not found")));
+        }
+        Ok(())
     }
 }
 

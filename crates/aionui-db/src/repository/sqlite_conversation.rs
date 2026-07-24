@@ -401,6 +401,18 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(rows)
     }
 
+    async fn owns_workspace(&self, user_id: &str, workspace: &str) -> Result<bool, DbError> {
+        let owns = sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM conversations \
+             WHERE user_id = ? AND json_extract(extra, '$.workspace') = ?)",
+        )
+        .bind(user_id)
+        .bind(workspace)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(owns)
+    }
+
     async fn get_assistant_snapshot(
         &self,
         conversation_id: &str,
@@ -1488,6 +1500,18 @@ mod tests {
         let associated = repo.list_associated(SYSTEM_USER_ID, &c1.id).await.unwrap();
         assert_eq!(associated.len(), 1);
         assert_eq!(associated[0].id, c2.id);
+    }
+
+    #[tokio::test]
+    async fn workspace_ownership_is_scoped_to_user() {
+        let (repo, _db) = setup().await;
+        let mut conversation = sample_conversation(SYSTEM_USER_ID);
+        conversation.extra = r#"{"workspace":"/private/workspace"}"#.to_string();
+        repo.create(&conversation).await.unwrap();
+
+        assert!(repo.owns_workspace(SYSTEM_USER_ID, "/private/workspace").await.unwrap());
+        assert!(!repo.owns_workspace("another-user", "/private/workspace").await.unwrap());
+        assert!(!repo.owns_workspace(SYSTEM_USER_ID, "/other/workspace").await.unwrap());
     }
 
     #[tokio::test]

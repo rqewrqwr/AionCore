@@ -75,6 +75,7 @@ pub(crate) fn data() -> Value {
             ]),
             domain("skills", &[
                 no_input(&["skills", "list"], "List available skills.", false),
+                stdin(&["skills", "create"], "Create and import a basic skill.", &["name", "description", "instructions"], &[], true, false),
                 stdin(&["skills", "info"], "Inspect a skill path.", &["skill_path"], &[], false, false),
                 no_input(&["skills", "paths"], "List configured skill paths.", false),
                 stdin(&["skills", "import"], "Import a skill.", &["skill_path"], &[], true, false),

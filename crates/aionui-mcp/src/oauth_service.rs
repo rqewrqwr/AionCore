@@ -88,7 +88,16 @@ impl McpOAuthService {
 
     /// Check whether the given server URL has a valid (non-expired) OAuth token.
     pub async fn check_oauth_status(&self, server_url: &str) -> Result<OAuthStatusResponse, McpError> {
-        let authenticated = self.has_valid_token(server_url).await?;
+        self.check_oauth_status_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, server_url)
+            .await
+    }
+
+    pub async fn check_oauth_status_for_user(
+        &self,
+        user_id: &str,
+        server_url: &str,
+    ) -> Result<OAuthStatusResponse, McpError> {
+        let authenticated = self.has_valid_token_for_user(user_id, server_url).await?;
         Ok(OAuthStatusResponse { authenticated })
     }
 
@@ -101,6 +110,10 @@ impl McpOAuthService {
     /// 5. Wait for the redirect with the authorization code
     /// 6. Exchange code for tokens and persist them
     pub async fn login(&self, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
+        self.login_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, server_url).await
+    }
+
+    pub async fn login_for_user(&self, user_id: &str, server_url: &str) -> Result<OAuthLoginResponse, McpError> {
         let (authorize_url, listener) = self.prepare_login_flow(server_url).await?;
 
         // Open browser.
@@ -122,7 +135,7 @@ impl McpOAuthService {
         };
 
         // Exchange code for tokens.
-        match self.exchange_code(server_url, code).await {
+        match self.exchange_code(user_id, server_url, code).await {
             Ok(()) => Ok(OAuthLoginResponse {
                 success: true,
                 error: None,
@@ -141,7 +154,12 @@ impl McpOAuthService {
     ///
     /// Idempotent: returns Ok even if no token was stored.
     pub async fn logout(&self, server_url: &str) -> Result<(), McpError> {
-        match self.token_repo.delete(server_url).await {
+        self.logout_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, server_url)
+            .await
+    }
+
+    pub async fn logout_for_user(&self, user_id: &str, server_url: &str) -> Result<(), McpError> {
+        match self.token_repo.delete_for_user(user_id, server_url).await {
             Ok(()) => {
                 debug!(server_url, "OAuth token deleted");
                 Ok(())
@@ -156,7 +174,12 @@ impl McpOAuthService {
 
     /// Return the list of server URLs that have stored OAuth tokens.
     pub async fn get_authenticated_servers(&self) -> Result<Vec<String>, McpError> {
-        let urls = self.token_repo.list_authenticated_urls().await?;
+        self.get_authenticated_servers_for_user(aionui_db::DEFAULT_RESOURCE_OWNER)
+            .await
+    }
+
+    pub async fn get_authenticated_servers_for_user(&self, user_id: &str) -> Result<Vec<String>, McpError> {
+        let urls = self.token_repo.list_authenticated_urls_for_user(user_id).await?;
         Ok(urls)
     }
 
@@ -166,7 +189,12 @@ impl McpOAuthService {
     /// automatically refreshes before returning.
     /// Returns `None` if no token is stored for this URL.
     pub async fn get_token(&self, server_url: &str) -> Result<Option<String>, McpError> {
-        let row = match self.token_repo.get_by_url(server_url).await? {
+        self.get_token_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, server_url)
+            .await
+    }
+
+    pub async fn get_token_for_user(&self, user_id: &str, server_url: &str) -> Result<Option<String>, McpError> {
+        let row = match self.token_repo.get_by_url_for_user(user_id, server_url).await? {
             Some(row) => row,
             None => return Ok(None),
         };
@@ -177,7 +205,7 @@ impl McpOAuthService {
             if now >= expires_at - EXPIRY_MARGIN_MS
                 && let Some(ref refresh_token) = row.refresh_token
             {
-                match self.refresh_token(server_url, refresh_token).await {
+                match self.refresh_token(user_id, server_url, refresh_token).await {
                     Ok(new_token) => return Ok(Some(new_token)),
                     Err(e) => {
                         warn!(
@@ -249,8 +277,8 @@ impl McpOAuthService {
     }
 
     /// Check if a valid (non-expired) token exists for the URL.
-    async fn has_valid_token(&self, server_url: &str) -> Result<bool, McpError> {
-        let row = match self.token_repo.get_by_url(server_url).await? {
+    async fn has_valid_token_for_user(&self, user_id: &str, server_url: &str) -> Result<bool, McpError> {
+        let row = match self.token_repo.get_by_url_for_user(user_id, server_url).await? {
             Some(row) => row,
             None => return Ok(false),
         };
@@ -378,7 +406,7 @@ impl McpOAuthService {
     }
 
     /// Exchange the authorization code for tokens and persist them.
-    async fn exchange_code(&self, server_url: &str, code: String) -> Result<(), McpError> {
+    async fn exchange_code(&self, user_id: &str, server_url: &str, code: String) -> Result<(), McpError> {
         let (auth_url_str, token_url_str, redirect_url_str, pkce_verifier) = {
             let mut guard = self.pending.lock().await;
             let pending = guard
@@ -411,13 +439,18 @@ impl McpOAuthService {
             .await
             .map_err(|e| McpError::OAuth(format!("Token exchange failed: {e}")))?;
 
-        self.persist_token(server_url, &token_result).await?;
+        self.persist_token(user_id, server_url, &token_result).await?;
         debug!(server_url, "OAuth tokens stored successfully");
         Ok(())
     }
 
     /// Refresh an expired access token using the refresh token.
-    async fn refresh_token(&self, server_url: &str, refresh_token_value: &str) -> Result<String, McpError> {
+    async fn refresh_token(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        refresh_token_value: &str,
+    ) -> Result<String, McpError> {
         let metadata = self.discover_endpoints(server_url).await?;
         let token_url =
             TokenUrl::new(metadata.token_endpoint).map_err(|e| McpError::OAuth(format!("Invalid token URL: {e}")))?;
@@ -444,13 +477,16 @@ impl McpOAuthService {
             .unwrap_or(refresh_token_value);
 
         self.token_repo
-            .upsert(UpsertOAuthTokenParams {
-                server_url,
-                access_token: &new_access_token,
-                refresh_token: Some(new_refresh),
-                token_type: "bearer",
-                expires_at,
-            })
+            .upsert_for_user(
+                user_id,
+                UpsertOAuthTokenParams {
+                    server_url,
+                    access_token: &new_access_token,
+                    refresh_token: Some(new_refresh),
+                    token_type: "bearer",
+                    expires_at,
+                },
+            )
             .await?;
 
         debug!(server_url, "OAuth token refreshed successfully");
@@ -458,17 +494,25 @@ impl McpOAuthService {
     }
 
     /// Persist token response to DB.
-    async fn persist_token<TR: TokenResponse>(&self, server_url: &str, token_result: &TR) -> Result<(), McpError> {
+    async fn persist_token<TR: TokenResponse>(
+        &self,
+        user_id: &str,
+        server_url: &str,
+        token_result: &TR,
+    ) -> Result<(), McpError> {
         let expires_at: Option<TimestampMs> = token_result.expires_in().map(|d| now_ms() + d.as_millis() as i64);
 
         self.token_repo
-            .upsert(UpsertOAuthTokenParams {
-                server_url,
-                access_token: token_result.access_token().secret(),
-                refresh_token: token_result.refresh_token().map(|t| t.secret().as_str()),
-                token_type: "bearer",
-                expires_at,
-            })
+            .upsert_for_user(
+                user_id,
+                UpsertOAuthTokenParams {
+                    server_url,
+                    access_token: token_result.access_token().secret(),
+                    refresh_token: token_result.refresh_token().map(|t| t.secret().as_str()),
+                    token_type: "bearer",
+                    expires_at,
+                },
+            )
             .await?;
 
         Ok(())
@@ -711,6 +755,7 @@ mod tests {
     impl IOAuthTokenRepository for ValidTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
                 server_url: "https://example.com".to_string(),
                 access_token: "valid_access_token".to_string(),
                 refresh_token: None,
@@ -743,6 +788,7 @@ mod tests {
     impl IOAuthTokenRepository for ExpiredTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
                 server_url: "https://example.com".to_string(),
                 access_token: "expired_token".to_string(),
                 refresh_token: None,
@@ -775,6 +821,7 @@ mod tests {
     impl IOAuthTokenRepository for NoExpiryTokenRepo {
         async fn get_by_url(&self, _: &str) -> Result<Option<aionui_db::models::OAuthTokenRow>, aionui_db::DbError> {
             Ok(Some(aionui_db::models::OAuthTokenRow {
+                owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
                 server_url: "https://example.com".to_string(),
                 access_token: "no_expiry_token".to_string(),
                 refresh_token: None,

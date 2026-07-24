@@ -532,6 +532,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_or_build_rebuilds_when_runtime_token_renewal_generation_advances() {
+        let mgr = make_manager();
+        let mut first_options = make_options("conv-1");
+        first_options.runtime_capabilities.runtime_token_renewal_generation = Some(7);
+        let h1 = mgr.get_or_build_task("conv-1", first_options).await.unwrap();
+
+        let mut same_generation = make_options("conv-1");
+        same_generation.runtime_capabilities.runtime_token_renewal_generation = Some(7);
+        let same = mgr.get_or_build_task("conv-1", same_generation).await.unwrap();
+        assert!(same_mock(&h1, &same));
+
+        let mut next_generation = make_options("conv-1");
+        next_generation.runtime_capabilities.runtime_token_renewal_generation = Some(8);
+        let h2 = mgr.get_or_build_task("conv-1", next_generation).await.unwrap();
+
+        assert!(!same_mock(&h1, &h2));
+        assert_eq!(mgr.active_count(), 1);
+    }
+
+    #[tokio::test]
     async fn get_or_build_is_single_flight_under_concurrency() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 

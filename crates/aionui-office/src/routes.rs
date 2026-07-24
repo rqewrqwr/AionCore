@@ -9,8 +9,9 @@ use axum::routing::{get, post};
 use std::path::{Path as FsPath, PathBuf};
 
 use aionui_api_types::{
-    ApiResponse, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest, PreviewSnapshotInfoDto,
-    PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest, StopPreviewRequest,
+    ApiResponse, DocumentConversionRequest, GetSnapshotContentRequest, ListSnapshotsRequest, PreviewHistoryTargetDto,
+    PreviewSnapshotInfoDto, PreviewUrlResponse, SaveSnapshotRequest, SnapshotContentResponse, StartPreviewRequest,
+    StopPreviewRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -20,6 +21,89 @@ use crate::error::OfficeError;
 use crate::proxy::ProxyError;
 use crate::state::OfficeRouterState;
 use crate::types::DocType;
+use tracing::warn;
+
+fn preview_owner_key(path: &str, doc_type: DocType) -> String {
+    format!("{}\u{0}{}", doc_type.proxy_prefix(), path)
+}
+
+async fn require_workspace_owner(
+    state: &OfficeRouterState,
+    user: &CurrentUser,
+    workspace: &str,
+) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    let repo = state
+        .conversation_repo
+        .as_ref()
+        .ok_or_else(|| ApiError::Forbidden("Workspace authorization is unavailable".to_owned()))?;
+    if repo
+        .owns_workspace(&user.id, workspace)
+        .await
+        .map_err(|error| ApiError::Internal(format!("Failed to authorize workspace: {error}")))?
+    {
+        return Ok(());
+    }
+    warn!(kind = "office", user_id = %user.id, "Office operation rejected for non-owner workspace");
+    Err(ApiError::Forbidden(
+        "Workspace is not owned by the current user".to_owned(),
+    ))
+}
+
+async fn require_conversation_owner(
+    state: &OfficeRouterState,
+    user: &CurrentUser,
+    conversation_id: &str,
+) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    let repo = state
+        .conversation_repo
+        .as_ref()
+        .ok_or_else(|| ApiError::Forbidden("Conversation authorization is unavailable".to_owned()))?;
+    let row = repo
+        .get(conversation_id)
+        .await
+        .map_err(|error| ApiError::Internal(format!("Failed to authorize conversation: {error}")))?;
+    if row.is_some_and(|row| row.user_id == user.id) {
+        return Ok(());
+    }
+    warn!(kind = "office", user_id = %user.id, conversation_id, "Office operation rejected for non-owner conversation");
+    Err(ApiError::NotFound("Conversation not found".to_owned()))
+}
+
+async fn require_preview_target_owner(
+    state: &OfficeRouterState,
+    user: &CurrentUser,
+    target: &PreviewHistoryTargetDto,
+) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    let mut authorized = false;
+    if let Some(conversation_id) = target.conversation_id.as_deref() {
+        require_conversation_owner(state, user, conversation_id).await?;
+        authorized = true;
+    }
+    if let Some(workspace) = target.workspace.as_deref() {
+        require_workspace_owner(state, user, workspace).await?;
+        if let Some(file_path) = target.file_path.as_deref() {
+            validate_path_with_extra_root(file_path, &[], Some(FsPath::new(workspace)))
+                .map_err(file_error_to_api_error)?;
+        }
+        authorized = true;
+    }
+    if authorized {
+        Ok(())
+    } else {
+        Err(ApiError::Forbidden(
+            "An owned conversation or workspace is required".to_owned(),
+        ))
+    }
+}
 
 impl From<OfficeError> for ApiError {
     fn from(err: OfficeError) -> Self {
@@ -84,65 +168,83 @@ struct ProxyPortPath {
 
 async fn start_word_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Word).await
+    start_preview(state, user, body, DocType::Word).await
 }
 
 async fn stop_word_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Word).await
+    stop_preview(state, user, body, DocType::Word).await
 }
 
 async fn start_excel_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Excel).await
+    start_preview(state, user, body, DocType::Excel).await
 }
 
 async fn stop_excel_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Excel).await
+    stop_preview(state, user, body, DocType::Excel).await
 }
 
 async fn start_ppt_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
-    start_preview(state, body, DocType::Ppt).await
+    start_preview(state, user, body, DocType::Ppt).await
 }
 
 async fn stop_ppt_preview(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
-    stop_preview(state, body, DocType::Ppt).await
+    stop_preview(state, user, body, DocType::Ppt).await
 }
 
 async fn start_preview(
     state: OfficeRouterState,
+    user: CurrentUser,
     body: Result<Json<StartPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<PreviewUrlResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_owner(&state, &user, workspace).await?;
+    }
+    let validated_path = if state.local_mode {
+        validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+    } else {
+        let workspace = req.workspace.as_deref().expect("checked above");
+        validate_path_with_extra_root(&req.file_path, &[], Some(FsPath::new(workspace)))
+            .map_err(file_error_to_api_error)?
+    };
     let validated_path = validated_path.to_string_lossy().into_owned();
 
     let result = state.watch_manager.start(&validated_path, doc_type).await;
 
     let resp = match result {
         Ok(port) => {
+            state.preview_port_owners.insert(port, user.id.clone());
+            state
+                .preview_path_owners
+                .insert(preview_owner_key(&validated_path, doc_type), user.id.clone());
             let url = format!("/api/{}/{}", doc_type.proxy_prefix(), port);
             PreviewUrlResponse { url, error: None }
         }
@@ -157,11 +259,32 @@ async fn start_preview(
 
 async fn stop_preview(
     state: OfficeRouterState,
+    user: CurrentUser,
     body: Result<Json<StopPreviewRequest>, JsonRejection>,
     doc_type: DocType,
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    state.watch_manager.stop(&req.file_path, doc_type).await;
+    if !state.local_mode {
+        let owned_path = std::fs::canonicalize(&req.file_path)
+            .unwrap_or_else(|_| PathBuf::from(&req.file_path))
+            .to_string_lossy()
+            .into_owned();
+        let key = preview_owner_key(&owned_path, doc_type);
+        let owns = state
+            .preview_path_owners
+            .get(&key)
+            .is_some_and(|owner| owner.value() == &user.id);
+        if !owns {
+            warn!(kind = "office", user_id = %user.id, "Office preview stop rejected for non-owner");
+            return Err(ApiError::NotFound("Preview not found".to_owned()));
+        }
+        state.preview_path_owners.remove(&key);
+    }
+    let stop_path = std::fs::canonicalize(&req.file_path)
+        .unwrap_or_else(|_| PathBuf::from(&req.file_path))
+        .to_string_lossy()
+        .into_owned();
+    state.watch_manager.stop(&stop_path, doc_type).await;
     Ok(Json(ApiResponse::success()))
 }
 
@@ -169,30 +292,33 @@ async fn stop_preview(
 
 async fn list_snapshots(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<ListSnapshotsRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Vec<PreviewSnapshotInfoDto>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_preview_target_owner(&state, &user, &req.target).await?;
     let snapshots = state.snapshot_service.list(&req.target).await?;
     Ok(Json(ApiResponse::ok(snapshots)))
 }
 
 async fn save_snapshot(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<SaveSnapshotRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<PreviewSnapshotInfoDto>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_preview_target_owner(&state, &user, &req.target).await?;
     let info = state.snapshot_service.save(&req.target, &req.content).await?;
     Ok(Json(ApiResponse::ok(info)))
 }
 
 async fn get_snapshot_content(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<GetSnapshotContentRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Option<SnapshotContentResponse>>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
+    require_preview_target_owner(&state, &user, &req.target).await?;
     let result = state
         .snapshot_service
         .get_content(&req.target, &req.snapshot_id)
@@ -204,11 +330,23 @@ async fn get_snapshot_content(
 
 async fn convert_document(
     State(state): State<OfficeRouterState>,
-    Extension(_user): Extension<CurrentUser>,
+    Extension(user): Extension<CurrentUser>,
     body: Result<Json<DocumentConversionRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<aionui_api_types::DocumentConversionResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let validated_path = validate_office_path(&state, &req.file_path, req.workspace.as_deref())?;
+    if !state.local_mode {
+        let workspace = req
+            .workspace
+            .as_deref()
+            .ok_or_else(|| ApiError::Forbidden("An owned workspace is required".to_owned()))?;
+        require_workspace_owner(&state, &user, workspace).await?;
+    }
+    let validated_path = if state.local_mode {
+        validate_office_path(&state, &req.file_path, req.workspace.as_deref())?
+    } else {
+        validate_path_with_extra_root(&req.file_path, &[], req.workspace.as_deref().map(FsPath::new))
+            .map_err(file_error_to_api_error)?
+    };
     let resp = state
         .conversion_service
         .convert(validated_path.to_string_lossy().as_ref(), req.to)
@@ -262,18 +400,22 @@ fn preview_error_code(error: &OfficeError) -> &'static str {
 
 async fn ppt_proxy(
     State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<ProxyPortPath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    require_preview_port_owner(&state, &user, params.port)?;
     let path = params.path.as_deref().unwrap_or("/");
     proxy_forward(state, params.port, path, DocType::Ppt, &headers).await
 }
 
 async fn office_watch_proxy(
     State(state): State<OfficeRouterState>,
+    Extension(user): Extension<CurrentUser>,
     Path(params): Path<ProxyPortPath>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    require_preview_port_owner(&state, &user, params.port)?;
     let path = params.path.as_deref().unwrap_or("/");
     let request_headers: Vec<(String, String)> = headers
         .iter()
@@ -295,6 +437,21 @@ async fn office_watch_proxy(
     Ok(response
         .body(axum::body::Body::from(proxy_resp.body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()))
+}
+
+fn require_preview_port_owner(state: &OfficeRouterState, user: &CurrentUser, port: u16) -> Result<(), ApiError> {
+    if state.local_mode {
+        return Ok(());
+    }
+    if state
+        .preview_port_owners
+        .get(&port)
+        .is_some_and(|owner| owner.value() == &user.id)
+    {
+        return Ok(());
+    }
+    warn!(kind = "office", user_id = %user.id, port, "Office preview proxy rejected for non-owner");
+    Err(ApiError::NotFound("Preview not found".to_owned()))
 }
 
 async fn proxy_forward(
@@ -482,6 +639,10 @@ mod tests {
             conversion_service: conversion,
             proxy_service: proxy,
             allowed_roots: vec![std::env::temp_dir()],
+            conversation_repo: None,
+            local_mode: true,
+            preview_port_owners: Arc::new(dashmap::DashMap::new()),
+            preview_path_owners: Arc::new(dashmap::DashMap::new()),
         }
     }
 }

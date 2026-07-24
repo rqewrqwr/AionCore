@@ -23,6 +23,25 @@ use crate::service::{AssistantRuntimePreferenceUpdate, ConversationService};
 const MAX_DIR_DEPTH: usize = 10;
 
 impl ConversationService {
+    async fn require_conversation_owner(&self, user_id: &str, conversation_id: &str) -> Result<(), ConversationError> {
+        let row = self
+            .conversation_repo()
+            .get(conversation_id)
+            .await
+            .map_err(|error| ConversationError::internal(format!("Failed to load conversation: {error}")))?;
+        if row.as_ref().is_some_and(|row| row.user_id == user_id) {
+            return Ok(());
+        }
+
+        warn!(
+            kind = "conversation",
+            conversation_id, user_id, "Conversation operation rejected for non-owner"
+        );
+        Err(ConversationError::NotFound {
+            id: conversation_id.to_owned(),
+        })
+    }
+
     // ── Config Options ──────────────────────────────────────────────
 
     pub async fn get_config_options(
@@ -128,6 +147,17 @@ impl ConversationService {
         Ok(response)
     }
 
+    pub async fn set_config_option_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        option_id: &str,
+        req: SetConfigOptionRequest,
+    ) -> Result<SetConfigOptionResponse, ConversationError> {
+        self.require_conversation_owner(user_id, conversation_id).await?;
+        self.set_config_option(conversation_id, option_id, req).await
+    }
+
     // ── Usage / Slash commands ──────────────────────────────────────
 
     pub async fn get_usage(&self, conversation_id: &str) -> Result<Option<serde_json::Value>, ConversationError> {
@@ -137,11 +167,29 @@ impl ConversationService {
             .map_err(ConversationError::from)
     }
 
+    pub async fn get_usage_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<serde_json::Value>, ConversationError> {
+        self.require_conversation_owner(user_id, conversation_id).await?;
+        self.get_usage(conversation_id).await
+    }
+
     pub async fn get_slash_commands(&self, conversation_id: &str) -> Result<Vec<SlashCommandItem>, ConversationError> {
         self.task(conversation_id)?
             .get_slash_commands()
             .await
             .map_err(ConversationError::from)
+    }
+
+    pub async fn get_slash_commands_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Vec<SlashCommandItem>, ConversationError> {
+        self.require_conversation_owner(user_id, conversation_id).await?;
+        self.get_slash_commands(conversation_id).await
     }
 
     // ── Side question ───────────────────────────────────────────────
@@ -157,6 +205,16 @@ impl ConversationService {
             .handle_side_question(req)
             .await
             .map_err(ConversationError::from)
+    }
+
+    pub async fn handle_side_question_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SideQuestionRequest,
+    ) -> Result<SideQuestionResponse, ConversationError> {
+        self.require_conversation_owner(user_id, conversation_id).await?;
+        self.handle_side_question(conversation_id, req).await
     }
 
     // ── Workspace browsing ──────────────────────────────────────────
@@ -281,5 +339,15 @@ impl ConversationService {
         });
 
         Ok(entries)
+    }
+
+    pub async fn browse_workspace_for_user(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        query: WorkspaceBrowseQuery,
+    ) -> Result<Vec<WorkspaceEntry>, ConversationError> {
+        self.require_conversation_owner(user_id, conversation_id).await?;
+        self.browse_workspace(conversation_id, query).await
     }
 }

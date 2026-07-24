@@ -266,12 +266,17 @@ fn parse_schedule(
 // ---------------------------------------------------------------------------
 
 pub fn cron_job_to_row(job: &CronJob) -> Result<CronJobRow, CronError> {
+    cron_job_to_row_for_owner(job, aionui_db::DEFAULT_RESOURCE_OWNER)
+}
+
+pub fn cron_job_to_row_for_owner(job: &CronJob, owner_user_id: &str) -> Result<CronJobRow, CronError> {
     let (schedule_kind, schedule_value, schedule_tz, schedule_description) = schedule_to_row_fields(&job.schedule);
 
     let agent_config_json = job.agent_config.as_ref().map(serde_json::to_string).transpose()?;
 
     Ok(CronJobRow {
         id: job.id.clone(),
+        owner_user_id: owner_user_id.to_owned(),
         name: job.name.clone(),
         enabled: job.enabled,
         schedule_kind,
@@ -556,6 +561,7 @@ mod tests {
     fn sample_row() -> CronJobRow {
         CronJobRow {
             id: "cron_test1".into(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: "Test Job".into(),
             enabled: true,
             schedule_kind: "every".into(),

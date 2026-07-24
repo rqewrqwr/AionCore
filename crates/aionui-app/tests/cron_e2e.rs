@@ -372,6 +372,7 @@ async fn cj5b_run_now_legacy_workspace_with_whitespace_succeeds() {
     cron_repo
         .insert(&aionui_db::models::CronJobRow {
             id: "cron_whitespace_workspace".into(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.to_owned(),
             name: "Legacy Workspace".into(),
             enabled: true,
             schedule_kind: "every".into(),

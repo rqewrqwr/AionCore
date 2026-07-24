@@ -23,7 +23,30 @@ impl ProviderService {
     /// List all providers with masked API keys.
     pub async fn list(&self) -> Result<Vec<ProviderResponse>, SystemError> {
         let rows = self.repo.list().await?;
-        rows.into_iter().map(|row| self.row_to_response(row)).collect()
+        self.rows_to_responses(rows)
+    }
+
+    pub async fn list_for_user(&self, user_id: &str) -> Result<Vec<ProviderResponse>, SystemError> {
+        let rows = self.repo.list_for_user(user_id).await?;
+        self.rows_to_responses(rows)
+    }
+
+    fn rows_to_responses(&self, rows: Vec<Provider>) -> Result<Vec<ProviderResponse>, SystemError> {
+        let mut providers = Vec::with_capacity(rows.len());
+        for row in rows {
+            let provider_id = row.id.clone();
+            match self.row_to_response(row) {
+                Ok(provider) => providers.push(provider),
+                Err(error) => {
+                    // A stale credential-encryption key or one malformed legacy
+                    // row must not make every healthy provider disappear from
+                    // the list. Keep the unreadable row in storage for recovery
+                    // and omit only that row from the response.
+                    tracing::warn!(%provider_id, %error, "skipping unreadable provider row");
+                }
+            }
+        }
+        Ok(providers)
     }
 
     /// Create a new provider. The API key is encrypted before storage.
@@ -33,6 +56,14 @@ impl ProviderService {
     /// frontend-local-store → backend migration path where existing provider
     /// ids must be preserved.
     pub async fn create(&self, req: CreateProviderRequest) -> Result<ProviderResponse, SystemError> {
+        self.create_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, req).await
+    }
+
+    pub async fn create_for_user(
+        &self,
+        user_id: &str,
+        req: CreateProviderRequest,
+    ) -> Result<ProviderResponse, SystemError> {
         validate_create_request(&req)?;
 
         let encrypted_key = encrypt_string(&req.api_key, &self.encryption_key)?;
@@ -61,12 +92,21 @@ impl ProviderService {
             is_full_url: req.is_full_url,
         };
 
-        let row = self.repo.create(params).await?;
+        let row = self.repo.create_for_user(user_id, params).await?;
         self.row_to_response(row)
     }
 
     /// Update an existing provider. Only provided fields are changed.
     pub async fn update(&self, id: &str, req: UpdateProviderRequest) -> Result<ProviderResponse, SystemError> {
+        self.update_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id, req).await
+    }
+
+    pub async fn update_for_user(
+        &self,
+        user_id: &str,
+        id: &str,
+        req: UpdateProviderRequest,
+    ) -> Result<ProviderResponse, SystemError> {
         validate_update_request(&req)?;
 
         let encrypted_key = req
@@ -97,14 +137,26 @@ impl ProviderService {
             is_full_url: req.is_full_url,
         };
 
-        let row = self.repo.update(id, params).await?;
+        let row = self.repo.update_for_user(user_id, id, params).await?;
         self.row_to_response(row)
     }
 
     /// Delete a provider by ID.
     pub async fn delete(&self, id: &str) -> Result<(), SystemError> {
-        self.repo.delete(id).await?;
+        self.delete_for_user(aionui_db::DEFAULT_RESOURCE_OWNER, id).await
+    }
+
+    pub async fn delete_for_user(&self, user_id: &str, id: &str) -> Result<(), SystemError> {
+        self.repo.delete_for_user(user_id, id).await?;
         Ok(())
+    }
+
+    pub async fn ensure_user_access(&self, user_id: &str, id: &str) -> Result<(), SystemError> {
+        if self.repo.find_by_id_for_user(user_id, id).await?.is_some() {
+            return Ok(());
+        }
+        tracing::warn!(user_id, provider_id = id, "provider access denied");
+        Err(SystemError::NotFound(format!("Provider {id} not found")))
     }
 
     // -----------------------------------------------------------------------
@@ -281,6 +333,19 @@ mod tests {
         let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         std::mem::forget(db);
         ProviderService::new(repo, TEST_KEY)
+    }
+
+    #[tokio::test]
+    async fn list_skips_rows_encrypted_with_an_unavailable_key() {
+        let db = init_database_memory().await.unwrap();
+        let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
+        let writer = ProviderService::new(repo.clone(), [0x24; 32]);
+        writer.create(sample_create_request()).await.unwrap();
+
+        let reader = ProviderService::new(repo, TEST_KEY);
+        let providers = reader.list().await.unwrap();
+
+        assert!(providers.is_empty());
     }
 
     fn sample_create_request() -> CreateProviderRequest {

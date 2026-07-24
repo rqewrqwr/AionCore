@@ -200,6 +200,34 @@ async fn fake_provider_list() -> axum::Json<serde_json::Value> {
     }))
 }
 
+async fn fake_skill_list() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "success": true,
+        "data": []
+    }))
+}
+
+async fn fake_skill_import(
+    State(capture): State<SharedCapture>,
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    let skill_path = payload["skill_path"].as_str().unwrap_or_default().to_owned();
+    let manifest = std::fs::read_to_string(std::path::PathBuf::from(&skill_path).join("SKILL.md")).unwrap();
+    *capture.lock().unwrap() = Some(Capture {
+        resource_id: Some(skill_path),
+        payload: Some(json!({ "manifest": manifest })),
+        ..Capture::default()
+    });
+    axum::Json(json!({
+        "success": true,
+        "data": {
+            "skill_name": "requirements-review",
+            "skill_names": ["requirements-review"],
+            "failed": []
+        }
+    }))
+}
+
 async fn fake_provider_update(
     State(capture): State<SharedCapture>,
     Path(provider_id): Path<String>,
@@ -357,6 +385,8 @@ async fn spawn_config_probe_server(capture: SharedCapture) -> (String, tokio::ta
         .route("/api/mcp/oauth/logout", post(fake_mcp_oauth_logout))
         .route("/api/providers", get(fake_provider_list).post(fake_provider_create))
         .route("/api/providers/{provider_id}", put(fake_provider_update))
+        .route("/api/skills", get(fake_skill_list))
+        .route("/api/skills/import", post(fake_skill_import))
         .route(
             "/api/skills/external-paths",
             get(fake_external_paths_list).post(fake_external_paths_add),
@@ -986,6 +1016,90 @@ async fn config_cron_current_update_reads_job_id_from_stdin_and_sends_runtime_he
 }
 
 #[tokio::test]
+async fn config_skill_create_stages_imports_and_cleans_a_basic_skill() {
+    let capture = Arc::new(Mutex::new(None));
+    let (base_url, handle) = spawn_config_probe_server(capture.clone()).await;
+
+    let mut child = config_command()
+        .args(["skills", "create"])
+        .env("AIONUI_BASE_URL", &base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-skill")
+        .env("AIONUI_USER_ID", "user-skill")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(
+            br#"{
+  "name": "requirements-review",
+  "description": "Review requirements",
+  "instructions": "Find ambiguity and missing acceptance criteria."
+}"#,
+        )
+        .await
+        .unwrap();
+    drop(child.stdin.take());
+
+    let output = child.wait_with_output().await.unwrap();
+    handle.abort();
+    assert!(
+        output.status.success(),
+        "skill create failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = capture
+        .lock()
+        .unwrap()
+        .take()
+        .expect("server should receive skill import");
+    let staged_path = captured.resource_id.expect("staged skill path");
+    let manifest = captured.payload.unwrap()["manifest"].as_str().unwrap().to_owned();
+    assert!(manifest.contains("name: \"requirements-review\""));
+    assert!(manifest.contains("description: \"Review requirements\""));
+    assert!(manifest.contains("Find ambiguity and missing acceptance criteria."));
+    assert!(!std::path::Path::new(&staged_path).exists());
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(stdout["data"]["skill_name"], "requirements-review");
+    assert!(stdout["meta"]["before"].is_array());
+    assert!(stdout["meta"]["after"].is_array());
+}
+
+#[tokio::test]
+async fn config_skill_create_rejects_path_traversal_names_before_import() {
+    let output = config_command()
+        .args(["skills", "create"])
+        .env("AIONUI_BASE_URL", "http://127.0.0.1:1")
+        .env("AIONUI_CONVERSATION_ID", "conv-skill")
+        .env("AIONUI_USER_ID", "user-skill")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut child = output;
+    child
+        .stdin
+        .as_mut()
+        .unwrap()
+        .write_all(br#"{"name":"../escape","description":"bad","instructions":"bad"}"#)
+        .await
+        .unwrap();
+    drop(child.stdin.take());
+    let output = child.wait_with_output().await.unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains(
+        "CONFIG_PAYLOAD_INVALID command=\"config skills create\" field=\"name\": invalid portable skill name"
+    ));
+}
+
+#[tokio::test]
 async fn config_context_fails_with_stable_error_when_conversation_env_missing() {
     let capture = Arc::new(Mutex::new(None));
     let (base_url, handle) = spawn_config_probe_server(capture).await;
@@ -1026,6 +1140,7 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config capabilities"));
     assert!(aionui_config.contains("assistant_id\": \"current"));
     for command in [
+        "\"$AIONUI_HELPER_BIN\" config skills create",
         "\"$AIONUI_HELPER_BIN\" config mcp servers",
         "\"$AIONUI_HELPER_BIN\" config providers",
         "\"$AIONUI_HELPER_BIN\" config settings",

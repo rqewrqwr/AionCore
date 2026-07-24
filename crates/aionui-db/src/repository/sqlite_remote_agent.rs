@@ -4,6 +4,7 @@ use sqlx::SqlitePool;
 use crate::error::DbError;
 use crate::models::RemoteAgentRow;
 use crate::repository::remote_agent::{CreateRemoteAgentParams, IRemoteAgentRepository, UpdateRemoteAgentParams};
+use crate::{DEFAULT_RESOURCE_OWNER, SHARED_RESOURCE_OWNER, resource_owner_subject};
 
 /// SQLite-backed implementation of [`IRemoteAgentRepository`].
 #[derive(Clone, Debug)]
@@ -27,6 +28,25 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
         Ok(rows)
     }
 
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<RemoteAgentRow>, DbError> {
+        if user_id == DEFAULT_RESOURCE_OWNER {
+            return self.list().await;
+        }
+        let owner = resource_owner_subject(user_id);
+        let rows = sqlx::query_as::<_, RemoteAgentRow>(
+            "SELECT r.* FROM remote_agents r \
+             INNER JOIN zigo_resource_ownership o \
+               ON o.resource_type = 'remote-agent' AND o.resource_id = r.id \
+             WHERE o.owner_subject_id IN (?, ?) AND o.scope IN ('PERSONAL', 'SHARED', 'SYSTEM') \
+             ORDER BY r.created_at ASC",
+        )
+        .bind(owner)
+        .bind(SHARED_RESOURCE_OWNER)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     async fn find_by_id(&self, id: &str) -> Result<Option<RemoteAgentRow>, DbError> {
         let row = sqlx::query_as::<_, RemoteAgentRow>("SELECT * FROM remote_agents WHERE id = ?")
             .bind(id)
@@ -34,6 +54,45 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
             .await?;
 
         Ok(row)
+    }
+
+    async fn find_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<RemoteAgentRow>, DbError> {
+        if user_id == DEFAULT_RESOURCE_OWNER {
+            return self.find_by_id(id).await;
+        }
+        let owner = resource_owner_subject(user_id);
+        let row = sqlx::query_as::<_, RemoteAgentRow>(
+            "SELECT r.* FROM remote_agents r \
+             INNER JOIN zigo_resource_ownership o \
+               ON o.resource_type = 'remote-agent' AND o.resource_id = r.id \
+             WHERE r.id = ? AND o.owner_subject_id IN (?, ?) \
+               AND o.scope IN ('PERSONAL', 'SHARED', 'SYSTEM')",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(SHARED_RESOURCE_OWNER)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn assign_to_user(&self, user_id: &str, id: &str) -> Result<(), DbError> {
+        let owner = resource_owner_subject(user_id);
+        let now = aionui_common::now_ms();
+        sqlx::query(
+            "INSERT INTO zigo_resource_ownership \
+             (resource_type, resource_id, owner_subject_id, scope, created_at, updated_at) \
+             VALUES ('remote-agent', ?, ?, 'PERSONAL', ?, ?) \
+             ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+               owner_subject_id = excluded.owner_subject_id, scope = excluded.scope, updated_at = excluded.updated_at",
+        )
+        .bind(id)
+        .bind(owner)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn create(&self, params: CreateRemoteAgentParams<'_>) -> Result<RemoteAgentRow, DbError> {
@@ -120,14 +179,21 @@ impl IRemoteAgentRepository for SqliteRemoteAgentRepository {
     }
 
     async fn delete(&self, id: &str) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
         let result = sqlx::query("DELETE FROM remote_agents WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await?;
 
         if result.rows_affected() == 0 {
             return Err(DbError::NotFound(format!("Remote agent '{id}' not found")));
         }
+
+        sqlx::query("DELETE FROM zigo_resource_ownership WHERE resource_type = 'remote-agent' AND resource_id = ?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
 
         Ok(())
     }
@@ -272,6 +338,18 @@ mod tests {
         assert_eq!(found.name, "Test Agent");
         assert_eq!(found.protocol, "acp");
         assert_eq!(found.auth_token.as_deref(), Some("encrypted_token"));
+    }
+
+    #[tokio::test]
+    async fn remote_agents_are_isolated_by_owner() {
+        let (repo, _db) = setup().await;
+        let created = repo.create(sample_params()).await.unwrap();
+        repo.assign_to_user("user-a", &created.id).await.unwrap();
+
+        assert!(repo.find_by_id_for_user("user-a", &created.id).await.unwrap().is_some());
+        assert!(repo.find_by_id_for_user("user-b", &created.id).await.unwrap().is_none());
+        assert_eq!(repo.list_for_user("user-a").await.unwrap().len(), 1);
+        assert!(repo.list_for_user("user-b").await.unwrap().is_empty());
     }
 
     #[tokio::test]

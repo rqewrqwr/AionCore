@@ -48,11 +48,19 @@ impl BuildTaskOptions {
         conversation_id: &str,
         helper_bin: Option<&str>,
         base_url: Option<&str>,
+        runtime_token: Option<&str>,
+        runtime_token_renewal_generation: Option<u64>,
+        private_gateway_url: Option<&str>,
     ) {
         self.context.runtime_env.retain(|(key, _)| {
             !matches!(
                 key.as_str(),
-                AIONUI_USER_ID_ENV | AIONUI_CONVERSATION_ID_ENV | AIONUI_HELPER_BIN_ENV | AIONUI_BASE_URL_ENV
+                AIONUI_USER_ID_ENV
+                    | AIONUI_CONVERSATION_ID_ENV
+                    | AIONUI_HELPER_BIN_ENV
+                    | AIONUI_BASE_URL_ENV
+                    | AIONUI_RUNTIME_TOKEN_ENV
+                    | AIONUI_PRIVATE_GATEWAY_URL_ENV
             )
         });
         self.context
@@ -71,7 +79,19 @@ impl BuildTaskOptions {
                 .runtime_env
                 .push((AIONUI_BASE_URL_ENV.to_owned(), base_url.to_owned()));
         }
+        if let Some(runtime_token) = runtime_token {
+            self.context
+                .runtime_env
+                .push((AIONUI_RUNTIME_TOKEN_ENV.to_owned(), runtime_token.to_owned()));
+        }
+        if let Some(private_gateway_url) = private_gateway_url {
+            self.context.runtime_env.push((
+                AIONUI_PRIVATE_GATEWAY_URL_ENV.to_owned(),
+                private_gateway_url.to_owned(),
+            ));
+        }
         self.runtime_capabilities.conversation_runtime_context_version = Some(CONVERSATION_RUNTIME_CONTEXT_VERSION);
+        self.runtime_capabilities.runtime_token_renewal_generation = runtime_token_renewal_generation;
     }
 }
 
@@ -79,21 +99,36 @@ pub const AIONUI_USER_ID_ENV: &str = "AIONUI_USER_ID";
 pub const AIONUI_CONVERSATION_ID_ENV: &str = "AIONUI_CONVERSATION_ID";
 pub const AIONUI_HELPER_BIN_ENV: &str = "AIONUI_HELPER_BIN";
 pub const AIONUI_BASE_URL_ENV: &str = "AIONUI_BASE_URL";
-pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 2;
+pub const AIONUI_RUNTIME_TOKEN_ENV: &str = "AIONUI_RUNTIME_TOKEN";
+pub const AIONUI_PRIVATE_GATEWAY_URL_ENV: &str = "AIONUI_PRIVATE_GATEWAY_URL";
+pub const CONVERSATION_RUNTIME_CONTEXT_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuntimeCapabilities {
     pub conversation_runtime_context_version: Option<u32>,
+    /// Generation of the scoped JWT injected into the Agent/MCP process.
+    ///
+    /// A newer requested generation forces the task manager to rebuild the
+    /// process, replacing the immutable child-process environment with a fresh
+    /// short-lived credential.
+    pub runtime_token_renewal_generation: Option<u64>,
 }
 
 impl RuntimeCapabilities {
     pub fn satisfies(&self, requested: &Self) -> bool {
-        match requested.conversation_runtime_context_version {
+        let context_version_satisfied = match requested.conversation_runtime_context_version {
             Some(version) => self
                 .conversation_runtime_context_version
                 .is_some_and(|actual| actual >= version),
             None => true,
-        }
+        };
+        let renewal_generation_satisfied = match requested.runtime_token_renewal_generation {
+            Some(generation) => self
+                .runtime_token_renewal_generation
+                .is_some_and(|actual| actual >= generation),
+            None => true,
+        };
+        context_version_satisfied && renewal_generation_satisfied
     }
 }
 
@@ -202,6 +237,9 @@ mod tests {
             "conv-1",
             Some("/Applications/AionUi/aioncore"),
             Some("http://127.0.0.1:25808"),
+            Some("runtime-token"),
+            Some(42),
+            Some("http://127.0.0.1:25811/zigo-enterprise/api"),
         );
 
         assert_eq!(
@@ -236,10 +274,17 @@ mod tests {
                 .contains(&(AIONUI_BASE_URL_ENV.to_owned(), "http://127.0.0.1:25808".to_owned()))
         );
         assert!(options.context.runtime_env.contains(&("EXISTING".into(), "1".into())));
+        assert!(
+            options
+                .context
+                .runtime_env
+                .contains(&(AIONUI_RUNTIME_TOKEN_ENV.to_owned(), "runtime-token".to_owned()))
+        );
         assert_eq!(
             options.runtime_capabilities.conversation_runtime_context_version,
             Some(CONVERSATION_RUNTIME_CONTEXT_VERSION)
         );
+        assert_eq!(options.runtime_capabilities.runtime_token_renewal_generation, Some(42));
     }
 
     #[test]

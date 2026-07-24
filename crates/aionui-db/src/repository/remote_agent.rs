@@ -13,8 +13,22 @@ pub trait IRemoteAgentRepository: Send + Sync {
     /// Returns all remote agents, ordered by creation time ascending.
     async fn list(&self) -> Result<Vec<RemoteAgentRow>, DbError>;
 
+    async fn list_for_user(&self, user_id: &str) -> Result<Vec<RemoteAgentRow>, DbError> {
+        let _ = user_id;
+        self.list().await
+    }
+
     /// Finds a remote agent by ID, or `None` if not found.
     async fn find_by_id(&self, id: &str) -> Result<Option<RemoteAgentRow>, DbError>;
+
+    async fn find_by_id_for_user(&self, user_id: &str, id: &str) -> Result<Option<RemoteAgentRow>, DbError> {
+        let _ = user_id;
+        self.find_by_id(id).await
+    }
+
+    async fn assign_to_user(&self, _user_id: &str, _id: &str) -> Result<(), DbError> {
+        Ok(())
+    }
 
     /// Creates a new remote agent and returns the inserted row.
     async fn create(&self, params: CreateRemoteAgentParams<'_>) -> Result<RemoteAgentRow, DbError>;

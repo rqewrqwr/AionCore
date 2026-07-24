@@ -53,11 +53,13 @@ pub use skill_routes::{SkillRouterState, skill_routes};
 pub use skill_service::{
     BUILTIN_SKILLS_ENV_VAR, ExternalSkillSource, NamedPath, ResolvedAgentSkill, ScannedSkill, SkillListItem,
     SkillPaths, SkillSource, builtin_skills_corpus, builtin_skills_materialize_marker, delete_skill,
-    delete_skill_with_repo, detect_and_count_external_skills, detect_common_skill_paths, export_skill_with_symlink,
-    get_skill_paths, import_skill, import_skills_with_repo, link_workspace_skills, list_available_skills,
-    list_available_skills_with_repo, materialize_skills_for_agent, materialize_skills_for_agent_with_repo,
-    read_builtin_rule, read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills,
-    sync_skill_catalog_into_repo,
+    delete_skill_with_repo, delete_skill_with_repo_for_owner, detect_and_count_external_skills,
+    detect_common_skill_paths, export_skill_with_symlink, get_skill_paths, get_skill_paths_for_owner, import_skill,
+    import_skills_with_repo, import_skills_with_repo_for_owner, link_workspace_skills, list_available_skills,
+    list_available_skills_with_repo, list_available_skills_with_repo_for_owner, materialize_skills_for_agent,
+    materialize_skills_for_agent_with_repo, materialize_skills_for_agent_with_repo_for_owner, read_builtin_rule,
+    read_builtin_skill, read_skill_info, resolve_skill_paths, scan_for_skills, sync_skill_catalog_into_repo,
+    user_skills_dir_for_owner,
 };
 pub use skill_service::{
     delete_assistant_rule, delete_assistant_skill, read_assistant_rule, read_assistant_skill, write_assistant_rule,
