@@ -22,6 +22,16 @@ use crate::manager::aionrs::{AionrsAgentManager, sanitize_session_messages};
 use crate::runtime_status::conversation_runtime_reporter;
 use crate::session_context::AionrsSessionBuildContext;
 use crate::types::{AionrsCompatOverrides, AionrsResolvedConfig};
+
+const ZIGO_WORKFLOW_MCP_NAME: &str = "zigo-workflows";
+const ZIGO_WORKFLOW_SECURITY_RULES: &str = "\
+[Zigo workflow security boundary]
+- Use zigo_workflow_* and zigo_execution_* MCP tools for every workflow discovery, creation, update, schedule change, activation, publication, execution, and execution-history operation.
+- Never use ExecCommand, Write, or Edit to inspect or change workflow service containers, databases, internal HTTP endpoints, credentials, or runtime files.
+- Workflow API updates refresh runtime state and do not require a service restart.
+- If a Zigo workflow MCP call fails, retry only through the MCP when safe, then report the structured error. Never fall back to infrastructure access.
+- The MCP is scoped to the authenticated current user. Do not attempt to discover or operate another user's workflows.";
+
 pub(super) async fn build(
     deps: Arc<AgentFactoryDeps>,
     build_context: AionrsSessionBuildContext,
@@ -66,6 +76,12 @@ pub(super) async fn build(
         deps.broadcaster.clone(),
     )
     .await;
+    if has_zigo_workflow_mcp(&extra_mcp_servers) {
+        overrides.system_prompt = Some(match overrides.system_prompt.take() {
+            Some(existing) => format!("{existing}\n\n{ZIGO_WORKFLOW_SECURITY_RULES}"),
+            None => ZIGO_WORKFLOW_SECURITY_RULES.to_owned(),
+        });
+    }
 
     if !extra_mcp_servers.is_empty() {
         info!(
@@ -217,6 +233,16 @@ pub(super) async fn build(
 
     let agent = AionrsAgentManager::new(ctx.conversation_id, ctx.workspace, config, resume_session).await?;
     Ok(AgentInstance::Aionrs(Arc::new(agent)))
+}
+
+fn has_zigo_workflow_mcp(servers: &HashMap<String, McpServerConfig>) -> bool {
+    servers.iter().any(|(name, config)| {
+        name == ZIGO_WORKFLOW_MCP_NAME
+            || config
+                .args
+                .as_ref()
+                .is_some_and(|args| args.iter().any(|arg| arg.ends_with("n8n-stdio.mjs")))
+    })
 }
 
 /// Map AionUi DB platform/protocol settings to the aionrs provider identifier.
@@ -1723,5 +1749,38 @@ mod tests {
         }
 
         assert_eq!(overrides.system_prompt.as_deref(), Some("Be concise."));
+    }
+
+    #[test]
+    fn zigo_workflow_mcp_is_detected_by_name_or_adapter_path() {
+        let named = HashMap::from([(
+            ZIGO_WORKFLOW_MCP_NAME.to_owned(),
+            McpServerConfig {
+                transport: TransportType::Stdio,
+                command: Some("node".into()),
+                args: Some(vec!["workflow-adapter.mjs".into()]),
+                env: None,
+                url: None,
+                headers: None,
+                deferred: Some(false),
+                startup_timeout_ms: None,
+            },
+        )]);
+        assert!(has_zigo_workflow_mcp(&named));
+
+        let adapter = HashMap::from([(
+            "legacy-name".to_owned(),
+            McpServerConfig {
+                transport: TransportType::Stdio,
+                command: Some("node".into()),
+                args: Some(vec!["/opt/zigo/n8n-stdio.mjs".into()]),
+                env: None,
+                url: None,
+                headers: None,
+                deferred: Some(false),
+                startup_timeout_ms: None,
+            },
+        )]);
+        assert!(has_zigo_workflow_mcp(&adapter));
     }
 }

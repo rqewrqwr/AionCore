@@ -8,6 +8,7 @@ use aion_agent::engine::AgentEngine;
 use aion_agent::output::OutputSink;
 use aion_agent::session::Session;
 use aion_config::config::{CliArgs, Config};
+use aion_config::hooks::HookDef;
 use aion_mcp::manager::McpManager;
 use aion_protocol::commands::SessionMode;
 use aion_protocol::{ToolApprovalManager, ToolApprovalResult};
@@ -29,6 +30,8 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+
+const ZIGO_WORKFLOW_MCP_NAME: &str = "zigo-workflows";
 
 #[derive(Clone, Debug)]
 struct AionrsFinalInputDumpContext {
@@ -167,6 +170,10 @@ impl AionrsAgentManager {
 
         if !config_extra.extra_mcp_servers.is_empty() {
             config.mcp.servers.extend(config_extra.extra_mcp_servers.clone());
+        }
+        if let Some(hook) = zigo_workflow_command_guard_hook(&config_extra.extra_mcp_servers) {
+            config.hooks.pre_tool_use.retain(|existing| existing.name != hook.name);
+            config.hooks.pre_tool_use.push(hook);
         }
 
         let is_resume = resume_session.is_some();
@@ -307,6 +314,52 @@ impl AionrsAgentManager {
             }
         }
     }
+}
+
+fn zigo_workflow_command_guard_hook(
+    servers: &HashMap<String, aion_config::config::McpServerConfig>,
+) -> Option<HookDef> {
+    for (name, server) in servers {
+        let adapter = server.args.as_ref().and_then(|arguments| {
+            arguments.iter().find_map(|argument| {
+                let path = PathBuf::from(argument);
+                (path.file_name()?.to_string_lossy() == "n8n-stdio.mjs").then_some(path)
+            })
+        });
+        if name != ZIGO_WORKFLOW_MCP_NAME && adapter.is_none() {
+            continue;
+        }
+        let adapter = adapter?;
+        let guard = adapter.with_file_name("workflow-command-guard.mjs");
+        if !guard.is_file() {
+            warn!(
+                guard_path = %guard.display(),
+                "Zigo workflow command guard is missing; refusing to install an ineffective hook"
+            );
+            return None;
+        }
+        let node = server.command.as_deref().unwrap_or("node");
+        #[cfg(windows)]
+        let command = format!(
+            "& '{}' '{}'",
+            node.replace('\'', "''"),
+            guard.to_string_lossy().replace('\'', "''")
+        );
+        #[cfg(not(windows))]
+        let command = format!(
+            "'{}' '{}'",
+            node.replace('\'', "'\"'\"'"),
+            guard.to_string_lossy().replace('\'', "'\"'\"'")
+        );
+        return Some(HookDef {
+            name: "zigo-workflow-infrastructure-boundary".to_owned(),
+            tool_match: vec!["ExecCommand".to_owned()],
+            file_match: vec![],
+            command,
+            timeout_ms: 5_000,
+        });
+    }
+    None
 }
 
 #[async_trait::async_trait]
