@@ -83,7 +83,7 @@ impl AgentType {
     /// Codex conversations use ACP metadata with `backend = "codex"`.
     pub fn native_skills_dirs(&self) -> Option<&'static [&'static str]> {
         match self {
-            AgentType::Aionrs => Some(&[".aionrs/skills"]),
+            AgentType::Aionrs => Some(&[".zigo/skills"]),
             AgentType::Acp
             | AgentType::OpenclawGateway
             | AgentType::Nanobot
@@ -379,6 +379,12 @@ mod tests {
         assert!(!AgentType::OpenclawGateway.supports_new_conversation());
         assert!(!AgentType::Nanobot.supports_new_conversation());
         assert!(!AgentType::Remote.supports_new_conversation());
+    }
+
+    #[test]
+    fn aionrs_native_skills_use_zigo_workspace_directory() {
+        assert_eq!(AgentType::Aionrs.native_skills_dirs(), Some(&[".zigo/skills"][..]));
+        assert_eq!(AgentType::Acp.native_skills_dirs(), None);
     }
 
     #[test]

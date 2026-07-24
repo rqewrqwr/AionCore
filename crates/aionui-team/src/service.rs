@@ -387,10 +387,25 @@ impl TeamSessionService {
 
         let team_id = generate_id();
         let now = now_ms();
+        let mut resolved_agents = Vec::with_capacity(req.agents.len());
+        for agent in &req.agents {
+            let (backend, model) = self
+                .resolve_spawn_backend_and_model(
+                    agent.assistant_id.as_deref(),
+                    Some(&agent.model),
+                    agent.backend.as_deref().unwrap_or_default(),
+                    &agent.model,
+                )
+                .await?;
+            let mut resolved = agent.clone();
+            resolved.backend = Some(backend);
+            resolved.model = model;
+            resolved_agents.push(resolved);
+        }
 
         let provisioned = self
             .provisioner()
-            .provision_initial_agents(user_id, &team_id, &req.agents, shared_workspace.as_deref())
+            .provision_initial_agents(user_id, &team_id, &resolved_agents, shared_workspace.as_deref())
             .await?;
         let agents = provisioned.agents;
         let lead_agent_id = provisioned.lead_agent_id;
@@ -540,6 +555,19 @@ impl TeamSessionService {
             )));
         }
         let mut team = Team::from_row(&row)?;
+        let (backend, model) = self
+            .resolve_spawn_backend_and_model(
+                req.assistant_id.as_deref(),
+                Some(&req.model),
+                req.backend.as_deref().unwrap_or_default(),
+                &req.model,
+            )
+            .await?;
+        let req = AddAgentRequest {
+            backend: Some(backend),
+            model,
+            ..req
+        };
         let agent = self.provisioner().add_agent(user_id, &row, &mut team, req).await?;
 
         if let Some(session) = self.sessions.get(team_id).map(|e| Arc::clone(&e.session)) {

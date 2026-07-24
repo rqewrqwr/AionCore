@@ -500,7 +500,7 @@ impl TeamAgentProvisioner {
                 Some(ProviderWithModel {
                     provider_id,
                     model: model.to_owned(),
-                    use_model: None,
+                    use_model: Some(model.to_owned()),
                 }),
                 extra,
             )

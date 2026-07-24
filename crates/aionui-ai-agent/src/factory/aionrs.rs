@@ -152,29 +152,32 @@ pub(super) async fn build(
             }
             Err(_) => {
                 // Fallback: old architecture stored sessions inside the workspace
-                let legacy_dir = std::path::Path::new(&ctx.workspace).join(".aionrs/sessions");
-                let legacy_mgr = SessionManager::new(legacy_dir.clone(), 100);
-                match legacy_mgr.load(&ctx.conversation_id) {
-                    Ok(mut session) => {
+                let workspace = std::path::Path::new(&ctx.workspace);
+                let legacy_dirs = [workspace.join(".zigo/sessions"), workspace.join(".aionrs/sessions")];
+                let mut loaded_session = None;
+                for legacy_dir in legacy_dirs {
+                    let legacy_mgr = SessionManager::new(legacy_dir.clone(), 100);
+                    if let Ok(mut session) = legacy_mgr.load(&ctx.conversation_id) {
                         let dropped = sanitize_session_messages(&mut session.messages);
                         info!(
                             conversation_id = %ctx.conversation_id,
                             session_id = %session.id,
                             message_count = session.messages.len(),
                             sanitized_dropped = dropped,
+                            session_directory = %legacy_dir.display(),
                             "Loaded legacy aionrs session from workspace"
                         );
-                        Some(session)
-                    }
-                    Err(e) => {
-                        debug!(
-                            conversation_id = %ctx.conversation_id,
-                            error = %e,
-                            "No existing aionrs session found, starting fresh"
-                        );
-                        None
+                        loaded_session = Some(session);
+                        break;
                     }
                 }
+                if loaded_session.is_none() {
+                    debug!(
+                        conversation_id = %ctx.conversation_id,
+                        "No existing aionrs session found, starting fresh"
+                    );
+                }
+                loaded_session
             }
         }
     };

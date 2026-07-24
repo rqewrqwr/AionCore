@@ -3382,6 +3382,10 @@ impl ConversationService {
             }
         }
 
+        if context.conversation.agent_type == AgentType::Aionrs {
+            migrate_legacy_aionrs_workspace_dir(&workspace).await;
+        }
+
         let skill_names = context_skill_names(context);
         if skill_names.is_empty() {
             return;
@@ -3795,6 +3799,63 @@ async fn native_skills_dirs(
     agent_type
         .native_skills_dirs()
         .map(|dirs| dirs.iter().map(|s| (*s).to_owned()).collect())
+}
+
+async fn migrate_legacy_aionrs_workspace_dir(workspace: &Path) {
+    let legacy_dir = workspace.join(".aionrs");
+    let branded_dir = workspace.join(".zigo");
+    if !legacy_dir.exists() {
+        return;
+    }
+
+    if !branded_dir.exists() {
+        match tokio::fs::rename(&legacy_dir, &branded_dir).await {
+            Ok(()) => {
+                info!(
+                    workspace = %workspace.display(),
+                    "Migrated legacy Aion workspace directory to .zigo"
+                );
+            }
+            Err(err) => {
+                warn!(
+                    workspace = %workspace.display(),
+                    error = %err,
+                    "Failed to migrate legacy Aion workspace directory to .zigo"
+                );
+            }
+        }
+        return;
+    }
+
+    let Ok(mut entries) = tokio::fs::read_dir(&legacy_dir).await else {
+        return;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if entry.file_name() != "skills" {
+            warn!(
+                workspace = %workspace.display(),
+                entry = %entry.file_name().to_string_lossy(),
+                "Preserving legacy Aion workspace directory with non-skill content"
+            );
+            return;
+        }
+    }
+
+    match tokio::fs::remove_dir_all(&legacy_dir).await {
+        Ok(()) => {
+            info!(
+                workspace = %workspace.display(),
+                "Removed duplicate legacy Aion workspace directory"
+            );
+        }
+        Err(err) => {
+            warn!(
+                workspace = %workspace.display(),
+                error = %err,
+                "Failed to remove duplicate legacy Aion workspace directory"
+            );
+        }
+    }
 }
 
 impl ConversationService {

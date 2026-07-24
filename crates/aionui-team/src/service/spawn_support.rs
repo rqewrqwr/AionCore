@@ -90,6 +90,7 @@ impl TeamSessionService {
             let requested_model = requested_model
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
+                .filter(|value| !matches!(*value, "default" | "auto"))
                 .map(str::to_owned);
             let fixed_model = (definition.default_model_mode == "fixed")
                 .then(|| definition.default_model_value.clone())
@@ -427,6 +428,7 @@ mod tests {
     fn provider_row(id: &str, models: &[&str]) -> Provider {
         Provider {
             id: id.into(),
+            owner_user_id: aionui_db::DEFAULT_RESOURCE_OWNER.into(),
             platform: "openai".into(),
             name: id.into(),
             base_url: "https://example.com".into(),
@@ -697,6 +699,26 @@ mod tests {
             matches!(&err, TeamError::InvalidRequest(msg) if msg.contains("not available for team mode")),
             "expected team-selectable assistant error, got {err:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn create_team_resolves_default_placeholder_from_assistant_fixed_model() {
+        let mut definition = assistant_definition("word-creator", "aionrs");
+        definition.default_model_mode = "fixed".into();
+        definition.default_model_value = Some("gpt-5-mini".into());
+        let svc = service_with_selectable_catalog(
+            vec![team_assistant_entry("word-creator", "Word Creator", "aionrs")],
+            vec![definition],
+        );
+        let mut req = single_agent_team_request("Assistant Model");
+        req.agents[0].assistant_id = Some("word-creator".into());
+        req.agents[0].backend = None;
+        req.agents[0].model = "default".into();
+
+        let created = svc.create_team("user1", req).await.unwrap();
+
+        assert_eq!(created.assistants[0].backend, "aionrs");
+        assert_eq!(created.assistants[0].model, "gpt-5-mini");
     }
 
     #[tokio::test]

@@ -17,6 +17,7 @@ Required Team behavior:
 - Use `team_send_message` for Team reporting instead of ordinary assistant replies.
 - Use `team_task_update` and `team_task_list` for task-board state.
 - Follow role permissions. Lead-only tools cannot be used by teammates.
+- Do not use emoji in messages, headings, lists, status labels, file references, or reports. Use plain text only.
 - Domain-specific assistant rules, MCP servers, and skills remain active only inside these Team boundaries."#;
 
 pub fn with_team_governance(role_prompt: &str) -> String {
@@ -33,6 +34,7 @@ mod tests {
         assert!(TEAM_GOVERNANCE_PROMPT.contains("Team Governance and the Team role prompt win"));
         assert!(TEAM_GOVERNANCE_PROMPT.contains("Lead-only tools"));
         assert!(TEAM_GOVERNANCE_PROMPT.contains("team_send_message"));
+        assert!(TEAM_GOVERNANCE_PROMPT.contains("Do not use emoji"));
     }
 
     #[test]
