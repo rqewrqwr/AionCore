@@ -132,7 +132,7 @@ fn authorize_scoped_runtime_token(
     Ok(())
 }
 
-fn private_asset_gateway_is_trusted(request: &Request, expected: Option<&str>) -> bool {
+pub(crate) fn private_asset_gateway_is_trusted(request: &Request, expected: Option<&str>) -> bool {
     let Some(expected) = expected.filter(|value| !value.is_empty()) else {
         return false;
     };

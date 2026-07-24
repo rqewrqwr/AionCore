@@ -14,6 +14,7 @@ use crate::error::AuthError;
 const TOKEN_EXPIRY: Duration = Duration::from_secs(24 * 60 * 60);
 const AGENT_RUNTIME_TOKEN_EXPIRY: Duration = Duration::from_secs(15 * 60);
 const AGENT_RUNTIME_TOKEN_RENEWAL_INTERVAL: Duration = Duration::from_secs(10 * 60);
+const AGENT_RUNTIME_TOKEN_RENEWAL_GRACE: Duration = Duration::from_secs(5 * 60);
 
 pub const AGENT_SKILL_CONFIG_SCOPE: &str = "agent-skill-config";
 
@@ -111,6 +112,66 @@ impl JwtService {
         conversation_id: &str,
     ) -> Result<AgentRuntimeToken, AuthError> {
         let now = now_secs()?;
+        self.sign_agent_skill_config_at(user_id, conversation_id, now)
+    }
+
+    /// Renew a conversation-scoped runtime token.
+    ///
+    /// A short grace period lets a long-running MCP process recover from timer
+    /// delays or machine sleep without turning an expired browser session into
+    /// a renewable credential. Signature, issuer, audience, scope, conversation
+    /// binding, blacklist state, and maximum expiry age are all revalidated.
+    pub fn renew_agent_skill_config(&self, token: &str) -> Result<AgentRuntimeToken, AuthError> {
+        self.renew_agent_skill_config_at(token, now_secs()?)
+    }
+
+    fn renew_agent_skill_config_at(&self, token: &str, now: u64) -> Result<AgentRuntimeToken, AuthError> {
+        let hash = token_hash(token);
+        if self.blacklist.contains_key(&hash) {
+            return Err(AuthError::TokenBlacklisted);
+        }
+
+        let secret = self
+            .secret
+            .read()
+            .map_err(|e| AuthError::TokenInvalid(format!("Secret lock poisoned: {e}")))?;
+        let mut validation = Validation::default();
+        validation.validate_exp = false;
+        validation.set_issuer(&[JWT_ISSUER]);
+        validation.set_audience(&[JWT_AUDIENCE]);
+        let payload = decode::<TokenPayload>(token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+            .map_err(|e| AuthError::TokenInvalid(format!("JWT verification failed: {e}")))?
+            .claims;
+        drop(secret);
+
+        if payload.scope.as_deref() != Some(AGENT_SKILL_CONFIG_SCOPE) {
+            return Err(AuthError::TokenInvalid(
+                "Token is not an Agent runtime credential".into(),
+            ));
+        }
+        let conversation_id = payload
+            .conversation_id
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AuthError::TokenInvalid("Agent runtime token is missing its conversation binding".into()))?;
+        if payload.iat > now.saturating_add(60) {
+            return Err(AuthError::TokenInvalid(
+                "Agent runtime token was issued in the future".into(),
+            ));
+        }
+        if payload.exp.saturating_add(AGENT_RUNTIME_TOKEN_RENEWAL_GRACE.as_secs()) < now {
+            return Err(AuthError::TokenExpired);
+        }
+
+        self.sign_agent_skill_config_at(&payload.user_id, conversation_id, now)
+    }
+
+    fn sign_agent_skill_config_at(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        now: u64,
+    ) -> Result<AgentRuntimeToken, AuthError> {
         let claims = TokenPayload {
             user_id: user_id.to_owned(),
             username: String::new(),
@@ -312,6 +373,57 @@ mod tests {
         assert!(interval < AGENT_RUNTIME_TOKEN_EXPIRY.as_secs());
         assert_eq!(agent_runtime_token_generation(interval - 1), 0);
         assert_eq!(agent_runtime_token_generation(interval), 1);
+    }
+
+    #[test]
+    fn agent_runtime_token_can_renew_before_expiry_and_during_short_grace() {
+        let service = test_service();
+        let original = service.sign_agent_skill_config_at("user_1", "conv_1", 1_000).unwrap();
+
+        let proactive = service.renew_agent_skill_config_at(&original.token, 1_600).unwrap();
+        let secret = service.secret.read().unwrap();
+        let mut validation = Validation::default();
+        validation.validate_exp = false;
+        validation.set_issuer(&[JWT_ISSUER]);
+        validation.set_audience(&[JWT_AUDIENCE]);
+        let proactive_payload = decode::<TokenPayload>(
+            &proactive.token,
+            &DecodingKey::from_secret(secret.as_bytes()),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(proactive_payload.iat, 1_600);
+        drop(secret);
+
+        let grace = service.renew_agent_skill_config_at(&original.token, 1_901).unwrap();
+        let secret = service.secret.read().unwrap();
+        let payload = decode::<TokenPayload>(&grace.token, &DecodingKey::from_secret(secret.as_bytes()), &validation)
+            .unwrap()
+            .claims;
+        assert_eq!(payload.user_id, "user_1");
+        assert_eq!(payload.conversation_id.as_deref(), Some("conv_1"));
+        assert_eq!(payload.iat, 1_901);
+        assert_eq!(payload.exp, 1_901 + AGENT_RUNTIME_TOKEN_EXPIRY.as_secs());
+    }
+
+    #[test]
+    fn agent_runtime_token_renewal_rejects_stale_or_unscoped_tokens() {
+        let service = test_service();
+        let scoped = service.sign_agent_skill_config_at("user_1", "conv_1", 1_000).unwrap();
+        assert!(matches!(
+            service.renew_agent_skill_config_at(
+                &scoped.token,
+                1_000 + AGENT_RUNTIME_TOKEN_EXPIRY.as_secs() + AGENT_RUNTIME_TOKEN_RENEWAL_GRACE.as_secs() + 1
+            ),
+            Err(AuthError::TokenExpired)
+        ));
+
+        let unscoped = service.sign("user_1", "admin").unwrap();
+        assert!(matches!(
+            service.renew_agent_skill_config_at(&unscoped, now_secs().unwrap()),
+            Err(AuthError::TokenInvalid(_))
+        ));
     }
 
     #[test]

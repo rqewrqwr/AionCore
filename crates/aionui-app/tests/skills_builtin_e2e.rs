@@ -115,6 +115,41 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     let json = body_json(resp).await;
     assert_eq!(json["success"], true);
     let arr = json["data"].as_array().unwrap();
+    let all_names: Vec<&str> = arr.iter().filter_map(|item| item["name"].as_str()).collect();
+    for expected in [
+        "zigo-config",
+        "zigo-troubleshooting",
+        "zigo-webui-public",
+        "zigo-webui-setup",
+    ] {
+        assert!(
+            all_names.contains(&expected),
+            "missing rebranded skill {expected}: {all_names:?}"
+        );
+    }
+    for legacy in [
+        "aionui-config",
+        "aionui-troubleshooting",
+        "aionui-webui-public",
+        "aionui-webui-setup",
+    ] {
+        assert!(!all_names.contains(&legacy), "legacy skill must stay hidden: {legacy}");
+    }
+    for item in arr {
+        if item["source"] == "builtin" {
+            let description = item["description"].as_str().unwrap_or_default();
+            assert!(
+                !description.to_ascii_lowercase().contains("aioncore"),
+                "builtin skill description still exposes aioncore: {}",
+                item["name"]
+            );
+        }
+    }
+    assert!(
+        arr.iter()
+            .any(|item| item["source"] == "builtin" && item["name"] == "zigo-workflows"),
+        "zigo-workflows should be shipped in the embedded builtin skill catalog",
+    );
     let auto_items: Vec<&Value> = arr
         .iter()
         .filter(|item| {
@@ -131,8 +166,8 @@ async fn unified_skill_list_includes_auto_inject_entries_from_embedded_corpus() 
     );
     let names: Vec<&str> = auto_items.iter().filter_map(|item| item["name"].as_str()).collect();
     assert!(
-        names.contains(&"aionui-config"),
-        "aionui-config should be shipped as an auto-inject builtin skill: {names:?}",
+        names.contains(&"zigo-config"),
+        "zigo-config should be shipped as an auto-inject builtin skill: {names:?}",
     );
     assert!(
         !names.contains(&"aionui-skills"),

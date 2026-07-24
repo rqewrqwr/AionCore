@@ -30,6 +30,7 @@ use crate::protocol::send_error::AgentSendError;
 use crate::types::{AionrsResolvedConfig, SendMessageData};
 
 use super::error::{aionrs_engine_error_to_send_error, aionrs_runtime_error_summary};
+use super::skill_bridge::stage_zigo_skills;
 
 const ZIGO_WORKFLOW_MCP_NAME: &str = "zigo-workflows";
 
@@ -179,7 +180,18 @@ impl AionrsAgentManager {
         let is_resume = resume_session.is_some();
         let provider_label = config.provider_label.clone();
 
+        let staged_skill_root = stage_zigo_skills(
+            PathBuf::from(&workspace).as_path(),
+            &config_extra.session_directory,
+            &conversation_id,
+        )
+        .await
+        .map_err(|error| AgentError::internal(format!("Failed to stage Zigo skills: {error}")))?;
+
         let mut bootstrap = AgentBootstrap::new(config, &workspace, sink).runtime_env(runtime_env);
+        if let Some(root) = staged_skill_root {
+            bootstrap = bootstrap.extra_skill_dirs(vec![root]);
+        }
         if let Some(session) = resume_session {
             info!(
                 conversation_id = %conversation_id,
@@ -706,7 +718,7 @@ mod tests {
             base_url: Some("https://example.test/v1".to_owned()),
             system_prompt: Some("assistant rule raw".to_owned()),
             session_mode: Some("yolo".to_owned()),
-            skills: vec!["aionui-config".to_owned()],
+            skills: vec!["zigo-config".to_owned()],
             mcp_servers,
             runtime_env: vec![("AIONUI_RAW".to_owned(), "raw-env-value".to_owned())],
         };
@@ -730,7 +742,7 @@ mod tests {
         assert_eq!(value["resolved_context"]["provider"], "openai");
         assert_eq!(value["resolved_context"]["model"], "gpt-test");
         assert_eq!(value["resolved_context"]["workspace"]["path"], "/workspace");
-        assert_eq!(value["resolved_context"]["skills"][0], "aionui-config");
+        assert_eq!(value["resolved_context"]["skills"][0], "zigo-config");
         assert_eq!(
             value["resolved_context"]["mcp_servers"]["raw-mcp"]["env"]["TOKEN"],
             "raw-token-value"

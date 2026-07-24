@@ -558,6 +558,26 @@ async fn t9_1_refresh_token_success() {
 }
 
 #[tokio::test]
+async fn t9_1b_refresh_scoped_runtime_token_preserves_scope_and_conversation() {
+    let (app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let token = ctx
+        .jwt_service
+        .sign_agent_skill_config("system_default_user", "conversation-1")
+        .unwrap();
+
+    let body = format!(r#"{{"token":"{token}"}}"#);
+    let resp = app.oneshot(json_post("/api/auth/refresh", &body)).await.unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp).await;
+    let payload = ctx.jwt_service.verify(json["token"].as_str().unwrap()).unwrap();
+    assert_eq!(payload.user_id, "system_default_user");
+    assert_eq!(payload.scope.as_deref(), Some(aionui_auth::AGENT_SKILL_CONFIG_SCOPE));
+    assert_eq!(payload.conversation_id.as_deref(), Some("conversation-1"));
+}
+
+#[tokio::test]
 async fn t9_2_refresh_invalid_token() {
     let (app, _ctx) = test_app().await;
 

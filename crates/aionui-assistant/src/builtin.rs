@@ -49,6 +49,10 @@ pub struct BuiltinAssistant {
     pub custom_skill_names: Vec<String>,
     #[serde(default)]
     pub disabled_builtin_skills: Vec<String>,
+    /// MCP server ids mounted by default for this official assistant.
+    /// An empty list keeps the existing automatic MCP-selection behaviour.
+    #[serde(default)]
+    pub default_mcp_ids: Vec<String>,
     /// Relative to the asset root; may contain `{locale}`.
     #[serde(default)]
     pub rule_file: Option<String>,
@@ -298,6 +302,19 @@ mod tests {
         // Sanity-check a couple of known ids from the committed manifest.
         assert!(reg.has("word-creator"));
         assert!(reg.has("cowork"));
+
+        let workflow = reg
+            .get("workflow-assistant")
+            .expect("workflow assistant should be shipped in the embedded manifest");
+        assert!(workflow.default_enabled);
+        assert_eq!(workflow.enabled_skills, ["zigo-workflows"]);
+        assert_eq!(workflow.default_mcp_ids, ["zigo_builtin_n8n_workflows"]);
+        for locale in ["zh-CN", "en-US", "ru-RU"] {
+            assert!(
+                reg.rule_bytes("workflow-assistant", locale).is_some(),
+                "workflow assistant rule should be embedded for {locale}"
+            );
+        }
     }
 
     #[test]

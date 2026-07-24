@@ -1416,7 +1416,7 @@ impl ConversationService {
             .await
             .map_err(|e| ConversationError::internal(format!("assistant preference lookup failed: {e}")))?;
 
-        let skill_ids = match overrides.skill_ids.as_ref() {
+        let skill_ids = canonicalize_skill_names(match overrides.skill_ids.as_ref() {
             Some(value) => value.clone(),
             None if definition.default_skills_mode == "fixed" => {
                 parse_json_string_list(Some(definition.default_skill_ids.as_str()), "default_skill_ids")?
@@ -1426,24 +1426,25 @@ impl ConversationService {
                 .map(|row| parse_json_string_list(Some(row.last_skill_ids.as_str()), "last_skill_ids"))
                 .transpose()?
                 .unwrap_or_default(),
-        };
-        let disabled_builtin_skill_ids = match overrides.disabled_builtin_skill_ids.as_ref() {
-            Some(value) => value.clone(),
-            None if definition.default_skills_mode == "fixed" => parse_json_string_list(
-                Some(definition.default_disabled_builtin_skill_ids.as_str()),
-                "default_disabled_builtin_skill_ids",
-            )?,
-            None => preference
-                .as_ref()
-                .map(|row| {
-                    parse_json_string_list(
-                        Some(row.last_disabled_builtin_skill_ids.as_str()),
-                        "last_disabled_builtin_skill_ids",
-                    )
-                })
-                .transpose()?
-                .unwrap_or_default(),
-        };
+        });
+        let disabled_builtin_skill_ids =
+            canonicalize_skill_names(match overrides.disabled_builtin_skill_ids.as_ref() {
+                Some(value) => value.clone(),
+                None if definition.default_skills_mode == "fixed" => parse_json_string_list(
+                    Some(definition.default_disabled_builtin_skill_ids.as_str()),
+                    "default_disabled_builtin_skill_ids",
+                )?,
+                None => preference
+                    .as_ref()
+                    .map(|row| {
+                        parse_json_string_list(
+                            Some(row.last_disabled_builtin_skill_ids.as_str()),
+                            "last_disabled_builtin_skill_ids",
+                        )
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
+            });
         let mcp_ids = match overrides.mcp_ids.as_ref() {
             Some(value) => value.clone(),
             None if definition.default_mcps_mode == "fixed" => {
@@ -3383,7 +3384,7 @@ impl ConversationService {
         }
 
         if context.conversation.agent_type == AgentType::Aionrs {
-            migrate_legacy_aionrs_workspace_dir(&workspace).await;
+            migrate_aionrs_workspace_skill_dir_to_zigo(&workspace).await;
         }
 
         let skill_names = context_skill_names(context);
@@ -3776,6 +3777,49 @@ fn context_skill_names(context: &AgentSessionContext) -> Vec<String> {
     context.skills.clone()
 }
 
+fn canonicalize_skill_names(names: Vec<String>) -> Vec<String> {
+    let mut canonical = Vec::with_capacity(names.len());
+    for name in names {
+        let name = match name.as_str() {
+            "aionui-config" => "zigo-config",
+            "aionui-troubleshooting" => "zigo-troubleshooting",
+            "aionui-webui-public" => "zigo-webui-public",
+            "aionui-webui-setup" => "zigo-webui-setup",
+            _ => name.as_str(),
+        }
+        .to_owned();
+        if !canonical.contains(&name) {
+            canonical.push(name);
+        }
+    }
+    canonical
+}
+
+#[cfg(test)]
+mod skill_brand_compat_tests {
+    use super::canonicalize_skill_names;
+
+    #[test]
+    fn legacy_skill_names_map_to_zigo_names_without_duplicates() {
+        let names = canonicalize_skill_names(vec![
+            "aionui-config".into(),
+            "zigo-config".into(),
+            "aionui-troubleshooting".into(),
+            "aionui-webui-public".into(),
+            "aionui-webui-setup".into(),
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "zigo-config",
+                "zigo-troubleshooting",
+                "zigo-webui-public",
+                "zigo-webui-setup"
+            ]
+        );
+    }
+}
+
 /// Resolve the native skills directory list for an agent by looking it
 /// up in the `agent_metadata` catalog (ACP vendors) or the bundled
 /// `AgentType` table (non-ACP built-ins).
@@ -3801,58 +3845,37 @@ async fn native_skills_dirs(
         .map(|dirs| dirs.iter().map(|s| (*s).to_owned()).collect())
 }
 
-async fn migrate_legacy_aionrs_workspace_dir(workspace: &Path) {
-    let legacy_dir = workspace.join(".aionrs");
-    let branded_dir = workspace.join(".zigo");
-    if !legacy_dir.exists() {
+async fn migrate_aionrs_workspace_skill_dir_to_zigo(workspace: &Path) {
+    let old_root = workspace.join(".aionrs");
+    let old_skills = old_root.join("skills");
+    let zigo_root = workspace.join(".zigo");
+    let zigo_skills = zigo_root.join("skills");
+    if !old_skills.exists() || zigo_skills.exists() {
         return;
     }
 
-    if !branded_dir.exists() {
-        match tokio::fs::rename(&legacy_dir, &branded_dir).await {
-            Ok(()) => {
-                info!(
-                    workspace = %workspace.display(),
-                    "Migrated legacy Aion workspace directory to .zigo"
-                );
-            }
-            Err(err) => {
-                warn!(
-                    workspace = %workspace.display(),
-                    error = %err,
-                    "Failed to migrate legacy Aion workspace directory to .zigo"
-                );
-            }
-        }
+    if let Err(err) = tokio::fs::create_dir_all(&zigo_root).await {
+        warn!(
+            workspace = %workspace.display(),
+            error = %err,
+            "Failed to prepare Zigo skill directory"
+        );
         return;
     }
 
-    let Ok(mut entries) = tokio::fs::read_dir(&legacy_dir).await else {
-        return;
-    };
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name() != "skills" {
-            warn!(
-                workspace = %workspace.display(),
-                entry = %entry.file_name().to_string_lossy(),
-                "Preserving legacy Aion workspace directory with non-skill content"
-            );
-            return;
-        }
-    }
-
-    match tokio::fs::remove_dir_all(&legacy_dir).await {
+    match tokio::fs::rename(&old_skills, &zigo_skills).await {
         Ok(()) => {
             info!(
                 workspace = %workspace.display(),
-                "Removed duplicate legacy Aion workspace directory"
+                "Migrated AionRS workspace skills to .zigo"
             );
+            let _ = tokio::fs::remove_dir(&old_root).await;
         }
         Err(err) => {
             warn!(
                 workspace = %workspace.display(),
                 error = %err,
-                "Failed to remove duplicate legacy Aion workspace directory"
+                "Failed to migrate AionRS workspace skills to .zigo"
             );
         }
     }

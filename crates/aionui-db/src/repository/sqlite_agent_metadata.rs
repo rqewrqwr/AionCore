@@ -728,8 +728,8 @@ mod tests {
         );
         let aion_cli = rows
             .iter()
-            .find(|r| r.name == "Aion CLI" && r.agent_source == "internal")
-            .expect("seeded Aion CLI row");
+            .find(|r| r.name == "Zigo CLI" && r.agent_source == "internal")
+            .expect("seeded Zigo CLI row");
         assert_eq!(aion_cli.native_skills_dirs.as_deref(), Some(r#"[".zigo/skills"]"#));
         // Nanobot and OpenClaw are builtin (not internal).
         assert!(rows.iter().any(|r| r.name == "Nanobot" && r.agent_source == "builtin"));

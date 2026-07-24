@@ -125,6 +125,10 @@ impl Command {
 
 #[derive(Args, Debug, Clone)]
 pub(crate) struct ConfigArgs {
+    /// Read the command JSON payload from this UTF-8 file instead of stdin.
+    #[arg(long, global = true, value_name = "PATH")]
+    pub input_file: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     pub command: ConfigCommand,
 }
@@ -650,6 +654,7 @@ mod tests {
         let cases = [
             (
                 Command::Config(ConfigArgs {
+                    input_file: None,
                     command: ConfigCommand::Context,
                 }),
                 "config",

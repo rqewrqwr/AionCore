@@ -132,6 +132,13 @@ impl AssistantService {
                 .map_err(|e| AssistantError::Internal(format!("encode builtin custom skills: {e}")))?;
             let default_disabled_builtin_skill_ids = serde_json::to_string(&builtin.disabled_builtin_skills)
                 .map_err(|e| AssistantError::Internal(format!("encode builtin disabled skills: {e}")))?;
+            let default_mcp_ids = serde_json::to_string(&builtin.default_mcp_ids)
+                .map_err(|e| AssistantError::Internal(format!("encode builtin MCPs: {e}")))?;
+            let default_mcps_mode = if builtin.default_mcp_ids.is_empty() {
+                "auto"
+            } else {
+                "fixed"
+            };
             let (avatar_type, avatar_value) = serialize_avatar("builtin", builtin.avatar.as_deref());
             let (definition_id, assistant_id) = self
                 .resolve_definition_identity("builtin", Some(&builtin.id), &builtin.id)
@@ -205,8 +212,8 @@ impl AssistantService {
                     default_skill_ids: &default_skill_ids,
                     custom_skill_names: &custom_skill_names,
                     default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
-                    default_mcps_mode: "auto",
-                    default_mcp_ids: "[]",
+                    default_mcps_mode,
+                    default_mcp_ids: &default_mcp_ids,
                 })
                 .await
                 .map_err(|e| AssistantError::Internal(format!("upsert builtin definition: {e}")))?;
@@ -2085,9 +2092,9 @@ impl AssistantService {
                 .unwrap_or_else(|| state.map(|row| row.sort_order).unwrap_or(0)),
             agent_id: projection.agent_id.clone(),
             agent: projection.agent.clone(),
-            enabled_skills: decode_str_list(Some(definition.default_skill_ids.as_str()))?,
+            enabled_skills: decode_skill_list(Some(definition.default_skill_ids.as_str()))?,
             custom_skill_names: decode_str_list(Some(definition.custom_skill_names.as_str()))?,
-            disabled_builtin_skills: decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
+            disabled_builtin_skills: decode_skill_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?,
             context: None,
             context_i18n: HashMap::new(),
             prompts: decode_str_list(Some(definition.recommended_prompts.as_str()))?,
@@ -2111,17 +2118,17 @@ impl AssistantService {
         projection: &AssistantRuntimeProjection,
     ) -> Result<AssistantDetailResponse, AssistantError> {
         let builtin_default = self.builtin_listing_default(definition);
-        let default_skill_ids = decode_str_list(Some(definition.default_skill_ids.as_str()))?;
+        let default_skill_ids = decode_skill_list(Some(definition.default_skill_ids.as_str()))?;
         let custom_skill_names = decode_str_list(Some(definition.custom_skill_names.as_str()))?;
         let default_disabled_builtin_skill_ids =
-            decode_str_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?;
+            decode_skill_list(Some(definition.default_disabled_builtin_skill_ids.as_str()))?;
         let default_mcp_ids = decode_str_list(Some(definition.default_mcp_ids.as_str()))?;
         let last_skill_ids = preference
-            .map(|row| decode_str_list(Some(row.last_skill_ids.as_str())))
+            .map(|row| decode_skill_list(Some(row.last_skill_ids.as_str())))
             .transpose()?
             .unwrap_or_default();
         let last_disabled_builtin_skill_ids = preference
-            .map(|row| decode_str_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
+            .map(|row| decode_skill_list(Some(row.last_disabled_builtin_skill_ids.as_str())))
             .transpose()?
             .unwrap_or_default();
         let last_mcp_ids = preference
@@ -2440,9 +2447,9 @@ struct SerializedFields {
 impl SerializedFields {
     fn from_create(req: &CreateAssistantRequest) -> Result<Self, AssistantError> {
         Ok(Self {
-            enabled_skills: encode_str_list(req.enabled_skills.as_deref())?,
+            enabled_skills: encode_skill_list(req.enabled_skills.as_deref())?,
             custom_skill_names: encode_str_list(req.custom_skill_names.as_deref())?,
-            disabled_builtin_skills: encode_str_list(req.disabled_builtin_skills.as_deref())?,
+            disabled_builtin_skills: encode_skill_list(req.disabled_builtin_skills.as_deref())?,
             prompts: encode_str_list(req.prompts.as_deref())?,
             models: encode_str_list(req.models.as_deref())?,
             name_i18n: encode_str_map(req.name_i18n.as_ref())?,
@@ -2453,9 +2460,9 @@ impl SerializedFields {
 
     fn from_update(req: &UpdateAssistantRequest) -> Result<Self, AssistantError> {
         Ok(Self {
-            enabled_skills: encode_str_list(req.enabled_skills.as_deref())?,
+            enabled_skills: encode_skill_list(req.enabled_skills.as_deref())?,
             custom_skill_names: encode_str_list(req.custom_skill_names.as_deref())?,
-            disabled_builtin_skills: encode_str_list(req.disabled_builtin_skills.as_deref())?,
+            disabled_builtin_skills: encode_skill_list(req.disabled_builtin_skills.as_deref())?,
             prompts: encode_str_list(req.prompts.as_deref())?,
             models: encode_str_list(req.models.as_deref())?,
             name_i18n: encode_str_map(req.name_i18n.as_ref())?,
@@ -2654,6 +2661,35 @@ fn encode_str_list(value: Option<&[String]>) -> Result<Option<String>, Assistant
     }
 }
 
+fn canonical_skill_name(name: &str) -> &str {
+    match name {
+        "aionui-config" => "zigo-config",
+        "aionui-troubleshooting" => "zigo-troubleshooting",
+        "aionui-webui-public" => "zigo-webui-public",
+        "aionui-webui-setup" => "zigo-webui-setup",
+        _ => name,
+    }
+}
+
+fn canonicalize_skill_names(names: Vec<String>) -> Vec<String> {
+    let mut canonical = Vec::with_capacity(names.len());
+    for name in names {
+        let name = canonical_skill_name(&name).to_owned();
+        if !canonical.contains(&name) {
+            canonical.push(name);
+        }
+    }
+    canonical
+}
+
+fn encode_skill_list(value: Option<&[String]>) -> Result<Option<String>, AssistantError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let canonical = canonicalize_skill_names(value.to_vec());
+    encode_str_list(Some(&canonical))
+}
+
 fn validate_scalar_default(
     value: &AssistantDefaultScalarRequest,
     field_name: &str,
@@ -2714,6 +2750,10 @@ fn decode_str_list(raw: Option<&str>) -> Result<Vec<String>, AssistantError> {
         }
         _ => Ok(Vec::new()),
     }
+}
+
+fn decode_skill_list(raw: Option<&str>) -> Result<Vec<String>, AssistantError> {
+    decode_str_list(raw).map(canonicalize_skill_names)
 }
 
 fn decode_str_map(raw: Option<&str>) -> Result<HashMap<String, String>, AssistantError> {
@@ -2853,6 +2893,26 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
+    #[test]
+    fn legacy_skill_names_are_canonicalized_for_assistant_io() {
+        let names = canonicalize_skill_names(vec![
+            "aionui-config".into(),
+            "zigo-config".into(),
+            "aionui-troubleshooting".into(),
+            "aionui-webui-public".into(),
+            "aionui-webui-setup".into(),
+        ]);
+        assert_eq!(
+            names,
+            vec![
+                "zigo-config",
+                "zigo-troubleshooting",
+                "zigo-webui-public",
+                "zigo-webui-setup"
+            ]
+        );
+    }
+
     struct Fixture {
         service: AssistantService,
         definition_repo: Arc<dyn IAssistantDefinitionRepository>,
@@ -2938,6 +2998,10 @@ mod tests {
                         "name": b.name,
                         "avatar": b.avatar,
                         "agent_ref": b.agent_ref,
+                        "enabled_skills": b.enabled_skills,
+                        "custom_skill_names": b.custom_skill_names,
+                        "disabled_builtin_skills": b.disabled_builtin_skills,
+                        "default_mcp_ids": b.default_mcp_ids,
                         "rule_file": b.rule_file,
                         "sort_order": b.sort_order,
                         "default_enabled": b.default_enabled,
@@ -3028,6 +3092,7 @@ mod tests {
             enabled_skills: Vec::new(),
             custom_skill_names: Vec::new(),
             disabled_builtin_skills: Vec::new(),
+            default_mcp_ids: Vec::new(),
             rule_file: None,
             prompts: Vec::new(),
             prompts_i18n: HashMap::new(),
@@ -4260,6 +4325,7 @@ mod tests {
     async fn bootstrap_materializes_builtin_and_syncs_legacy_rows() {
         let mut builtin = mk_builtin("builtin-office", "Office");
         builtin.rule_file = Some("rules/builtin-office.{locale}.md".into());
+        builtin.default_mcp_ids = vec!["builtin-mcp".into()];
         let fx = fixture_with_builtins(vec![builtin]).await;
 
         fx.service
@@ -4293,6 +4359,8 @@ mod tests {
         assert_eq!(builtin.source, "builtin");
         assert_eq!(builtin.rule_resource_type, "builtin_asset");
         assert_eq!(builtin.rule_resource_ref.as_deref(), Some("builtin-office"));
+        assert_eq!(builtin.default_mcps_mode, "fixed");
+        assert_eq!(builtin.default_mcp_ids, r#"["builtin-mcp"]"#);
         let user = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
         assert_eq!(user.source, "user");
         let builtin_state = fx.state_repo.get(&builtin.id).await.unwrap().unwrap();

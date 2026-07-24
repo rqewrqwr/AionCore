@@ -68,6 +68,27 @@ async fn fake_assistant_rule_write(
     }))
 }
 
+async fn fake_assistant_list() -> axum::Json<serde_json::Value> {
+    axum::Json(json!({
+        "success": true,
+        "data": []
+    }))
+}
+
+async fn fake_assistant_create(
+    State(capture): State<SharedCapture>,
+    axum::Json(payload): axum::Json<serde_json::Value>,
+) -> axum::Json<serde_json::Value> {
+    *capture.lock().unwrap() = Some(Capture {
+        payload: Some(payload),
+        ..Capture::default()
+    });
+    axum::Json(json!({
+        "success": true,
+        "data": { "id": "assistant-created" }
+    }))
+}
+
 async fn fake_conversation_cron_list(
     State(capture): State<SharedCapture>,
     headers: HeaderMap,
@@ -295,10 +316,22 @@ async fn fake_agent_custom_update(
 async fn fake_agent_management_list() -> axum::Json<serde_json::Value> {
     axum::Json(json!({
         "success": true,
-        "data": [{
-            "id": "agent/custom",
-            "name": "Updated Agent"
-        }]
+        "data": [
+            {
+                "id": "agent/custom",
+                "name": "Updated Agent"
+            },
+            {
+                "id": "632f31d2",
+                "name": "Aion CLI",
+                "name_i18n": {
+                    "zh-CN": "Aion CLI",
+                    "en-US": "Aion CLI"
+                },
+                "agent_type": "aionrs",
+                "agent_source": "internal"
+            }
+        ]
     }))
 }
 
@@ -370,6 +403,7 @@ async fn spawn_config_probe_server(capture: SharedCapture) -> (String, tokio::ta
     let addr = listener.local_addr().unwrap();
     let app = axum::Router::new()
         .route("/api/conversations/{id}", get(fake_context_conversation))
+        .route("/api/assistants", get(fake_assistant_list).post(fake_assistant_create))
         .route("/api/skills/assistant-rule/read", post(fake_assistant_rule_read))
         .route("/api/skills/assistant-rule/write", post(fake_assistant_rule_write))
         .route("/api/internal/conversation-cron/list", get(fake_conversation_cron_list))
@@ -744,6 +778,49 @@ async fn config_provider_create_redacts_api_key_from_stdout() {
 }
 
 #[tokio::test]
+async fn config_assistant_create_accepts_utf8_bom_input_file_for_powershell() {
+    let capture = Arc::new(Mutex::new(None));
+    let (base_url, handle) = spawn_config_probe_server(capture.clone()).await;
+    let input_path = std::env::temp_dir().join(format!(
+        "zigo-config-input-{}-{}.json",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::write(
+        &input_path,
+        b"\xef\xbb\xbf{\"name\":\"PowerShell Assistant\",\"description\":\"Created once\",\"agent_id\":\"632f31d2\"}",
+    )
+    .unwrap();
+
+    let output = config_command()
+        .args(["--input-file", input_path.to_str().unwrap(), "assistants", "create"])
+        .env("AIONUI_BASE_URL", &base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-assistant")
+        .env("AIONUI_USER_ID", "user-assistant")
+        .output()
+        .await
+        .unwrap();
+
+    let _ = std::fs::remove_file(input_path);
+    handle.abort();
+    assert!(
+        output.status.success(),
+        "assistant create failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let captured = capture
+        .lock()
+        .unwrap()
+        .take()
+        .expect("server should receive assistant create");
+    assert_eq!(captured.payload.unwrap()["name"], "PowerShell Assistant");
+}
+
+#[tokio::test]
 async fn config_agent_custom_update_reads_agent_id_from_stdin() {
     let capture = Arc::new(Mutex::new(None));
     let (base_url, handle) = spawn_config_probe_server(capture.clone()).await;
@@ -784,6 +861,42 @@ async fn config_agent_custom_update_reads_agent_id_from_stdin() {
     assert_eq!(captured.resource_id.as_deref(), Some("agent/custom"));
     let payload = captured.payload.unwrap();
     assert!(payload.get("agent_id").is_none());
+}
+
+#[tokio::test]
+async fn config_agents_list_uses_zigo_product_name_for_internal_engine() {
+    let capture = Arc::new(Mutex::new(None));
+    let (base_url, handle) = spawn_config_probe_server(capture).await;
+
+    let output = config_command()
+        .args(["agents", "list"])
+        .env("AIONUI_BASE_URL", &base_url)
+        .env("AIONUI_CONVERSATION_ID", "conv-agent")
+        .env("AIONUI_USER_ID", "user-agent")
+        .output()
+        .await
+        .unwrap();
+
+    handle.abort();
+    assert!(
+        output.status.success(),
+        "agent list failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout_text = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout_text.contains("aionrs"));
+    assert!(!stdout_text.contains("Aion CLI"));
+    let stdout: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let zigo = stdout["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|agent| agent["id"] == "632f31d2")
+        .unwrap();
+    assert_eq!(zigo["name"], "Zigo CLI");
+    assert_eq!(zigo["agent_type"], "zigo");
+    assert_eq!(zigo["name_i18n"]["zh-CN"], "Zigo CLI");
 }
 
 #[tokio::test]
@@ -1127,18 +1240,18 @@ async fn config_context_fails_with_stable_error_when_conversation_env_missing() 
 #[test]
 fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/builtin-skills/auto-inject");
-    let aionui_config = std::fs::read_to_string(root.join("aionui-config/SKILL.md")).unwrap();
+    let zigo_config = std::fs::read_to_string(root.join("zigo-config/SKILL.md")).unwrap();
     let cron = std::fs::read_to_string(root.join("cron/SKILL.md")).unwrap();
 
     for forbidden in ["python3", "aionui_api.py", "lsof", "netstat", "curl"] {
         assert!(
-            !aionui_config.contains(forbidden),
-            "aionui-config skill must not mention {forbidden}"
+            !zigo_config.contains(forbidden),
+            "zigo-config skill must not mention {forbidden}"
         );
     }
-    assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config context"));
-    assert!(aionui_config.contains("\"$AIONUI_HELPER_BIN\" config capabilities"));
-    assert!(aionui_config.contains("assistant_id\": \"current"));
+    assert!(zigo_config.contains("\"$AIONUI_HELPER_BIN\" config context"));
+    assert!(zigo_config.contains("\"$AIONUI_HELPER_BIN\" config capabilities"));
+    assert!(zigo_config.contains("assistant_id\": \"current"));
     for command in [
         "\"$AIONUI_HELPER_BIN\" config skills create",
         "\"$AIONUI_HELPER_BIN\" config mcp servers",
@@ -1149,8 +1262,8 @@ fn builtin_config_skills_use_config_cli_not_python_or_cron_helper() {
         "\"$AIONUI_HELPER_BIN\" config skills external-paths",
     ] {
         assert!(
-            aionui_config.contains(command),
-            "aionui-config skill must document {command}"
+            zigo_config.contains(command),
+            "zigo-config skill must document {command}"
         );
     }
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
-use axum::http::{Request, StatusCode, header};
+use axum::http::{Method, Request, StatusCode, header};
 use axum::middleware;
 use axum::routing::{get, post};
 use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
@@ -100,6 +100,32 @@ async fn t12_2_post_with_matching_csrf_tokens_accepted() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn t12_2_post_from_trusted_private_gateway_bypasses_browser_csrf() {
+    use aionui_auth::middleware::PRIVATE_ASSET_GATEWAY_SECRET_HEADER;
+
+    let secret = format!("csrf-private-gateway-{}", std::process::id());
+    unsafe {
+        std::env::set_var("AIONUI_PRIVATE_GATEWAY_SECRET", &secret);
+    }
+    let response = csrf_app()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/api/test")
+                .header(PRIVATE_ASSET_GATEWAY_SECRET_HEADER, &secret)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    unsafe {
+        std::env::remove_var("AIONUI_PRIVATE_GATEWAY_SECRET");
+    }
+
+    assert_eq!(response.status(), StatusCode::OK);
 }
 
 #[tokio::test]

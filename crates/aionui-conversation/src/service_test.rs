@@ -6995,7 +6995,7 @@ async fn warmup_restores_skill_links_for_recreated_auto_workspace() {
 }
 
 #[tokio::test]
-async fn warmup_migrates_legacy_aionrs_directory_in_auto_workspace() {
+async fn warmup_migrates_aionrs_skill_directory_to_zigo_workspace() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
 
@@ -7014,13 +7014,13 @@ async fn warmup_migrates_legacy_aionrs_directory_in_auto_workspace() {
         Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
     svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
 
-    assert!(!workspace.join(".aionrs").exists());
     assert!(workspace.join(".zigo/skills/legacy").is_dir());
     assert!(workspace.join(".zigo/skills/cron").is_dir());
+    assert!(!workspace.join(".aionrs").exists());
 }
 
 #[tokio::test]
-async fn warmup_removes_duplicate_legacy_aionrs_skill_directory() {
+async fn warmup_preserves_zigo_skills_when_old_aionrs_copy_exists() {
     let resolver = Arc::new(RecordingSkillResolver::new(vec!["cron".into()]));
     let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
 
@@ -7037,8 +7037,8 @@ async fn warmup_removes_duplicate_legacy_aionrs_skill_directory() {
         Arc::new(MockTaskManagerWithWorkspace::new(workspace.to_str().unwrap()));
     svc.warmup("user-1", &resp.id, &task_mgr).await.unwrap();
 
-    assert!(!workspace.join(".aionrs").exists());
     assert!(workspace.join(".zigo/skills/cron").is_dir());
+    assert!(workspace.join(".aionrs/skills/legacy").is_dir());
 }
 
 #[tokio::test]

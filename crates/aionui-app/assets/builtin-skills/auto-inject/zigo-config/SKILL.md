@@ -1,14 +1,14 @@
 ---
-name: aionui-config
+name: zigo-config
 description: >-
-  Configure AionUi itself through the bundled aioncore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify an AionUi assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their AionUi installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
+  Configure Zigo itself through the bundled zigocore config CLI: create and edit assistants, update assistant rules, inspect and import skills, manage MCP servers, configure model providers, update settings, manage agents, configure scheduled tasks, and manage app configuration from an agent conversation. Use when the user wants you to set up or modify a Zigo assistant, attach skills, change an assistant's system prompt, add MCP or model provider configuration, schedule recurring work, or otherwise configure their Zigo installation, including when the user needs to know whether assistant changes affect the current conversation or only new conversations.
 ---
 
-# AionUi Config
+# Zigo Config
 
-Configure AionUi with the bundled agent-facing CLI. Do not discover ports, do
+Configure Zigo with the bundled agent-facing CLI. Do not discover ports, do
 not call raw backend paths, and do not depend on tools outside the bundled
-`aioncore` binary.
+`zigocore` binary.
 
 ## Rules
 
@@ -25,6 +25,38 @@ not call raw backend paths, and do not depend on tools outside the bundled
 11. Never reveal provider keys, MCP headers, environment values, or other secrets.
 12. If the CLI fails, report the stable `CONFIG_...` error from stderr in normal prose and do not claim the change was made.
 13. After assistant changes, explain both persistence and effect timing. Saving and read-back do not mean the current running conversation has reloaded the changed runtime behavior.
+14. Use product-facing Zigo names in every reply. The built-in engine is `Zigo CLI`; never expose legacy implementation names such as `aionrs`, `AionRS`, `Aion CLI`, or `aioncore`.
+15. Detect the active shell before running a write command. On PowerShell, never use Bash heredocs and never experiment with stdin/process piping. Use the `--input-file` pattern below once.
+
+## Windows PowerShell input
+
+On Windows PowerShell, write JSON to a temporary UTF-8 file and pass it with
+the global `--input-file` option. This is the required pattern for every config
+command that needs JSON:
+
+```powershell
+$payload = @{
+  name = "Requirements Analyst"
+  description = "Turn rough product ideas into clear PRDs"
+  agent_id = "632f31d2"
+  prompts = @("Turn this feature idea into a PRD")
+} | ConvertTo-Json -Depth 20 -Compress
+$inputPath = [System.IO.Path]::GetTempFileName()
+try {
+  [System.IO.File]::WriteAllText(
+    $inputPath,
+    $payload,
+    [System.Text.UTF8Encoding]::new($false)
+  )
+  & $env:AIONUI_HELPER_BIN config --input-file $inputPath assistants create
+} finally {
+  Remove-Item -LiteralPath $inputPath -Force -ErrorAction SilentlyContinue
+}
+```
+
+Change only the payload and the command words after `$inputPath`. Do not inspect
+source code, retry alternate quoting, use `cmd.exe`, or construct
+`System.Diagnostics.Process` when this supported form is available.
 
 ## Output
 
@@ -44,7 +76,7 @@ Failures print one stable error line to stderr. Treat stderr as authoritative.
 
 ## Capability Discovery
 
-Ask aioncore what this version supports:
+Ask zigocore what this version supports:
 
 ```bash
 "$AIONUI_HELPER_BIN" config capabilities
@@ -69,7 +101,7 @@ rules or defaults.
 
 ## Assistant Change Timing
 
-AionUi persists assistant configuration immediately, but running conversations
+Zigo persists assistant configuration immediately, but running conversations
 may keep the assistant snapshot created when the conversation started. Use this
 timing model when reporting successful assistant changes:
 
@@ -121,7 +153,7 @@ Create an assistant:
     "Turn this feature idea into a PRD",
     "Review this PRD and identify confusing parts for new users"
   ],
-  "enabled_skills": ["aionui-config"]
+  "enabled_skills": ["zigo-config"]
 }
 JSON
 ```
@@ -246,7 +278,7 @@ Attach skills to an assistant by updating the assistant's full skill list:
 "$AIONUI_HELPER_BIN" config assistants update <<'JSON'
 {
   "assistant_id": "current",
-  "enabled_skills": ["aionui-config", "cron"]
+  "enabled_skills": ["zigo-config", "cron"]
 }
 JSON
 ```

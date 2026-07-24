@@ -5,6 +5,7 @@ use std::fs;
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use reqwest::Method;
@@ -26,8 +27,10 @@ const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
 const ENV_PRIVATE_GATEWAY_URL: &str = "AIONUI_PRIVATE_GATEWAY_URL";
+static CONFIG_INPUT_FILE: OnceLock<Option<PathBuf>> = OnceLock::new();
 
 pub async fn run_config(args: ConfigArgs) -> ExitCode {
+    let _ = CONFIG_INPUT_FILE.set(args.input_file.clone());
     match run(args).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -455,7 +458,7 @@ impl StagedSkill {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        let root = std::env::temp_dir().join(format!("aionui-config-skill-{}-{nonce}", std::process::id()));
+        let root = std::env::temp_dir().join(format!("zigo-config-skill-{}-{nonce}", std::process::id()));
         let skill_dir = root.join(name);
         fs::create_dir_all(&skill_dir).map_err(|_| {
             ConfigError::new(
@@ -798,14 +801,10 @@ async fn run_settings_client_put(client: &reqwest::Client) -> Result<(), ConfigE
 async fn run_agents(client: &reqwest::Client, args: ConfigAgentsArgs) -> Result<(), ConfigError> {
     match args.command {
         ConfigAgentsCommand::List => {
-            run_no_input_request(
-                client,
-                "config agents list",
-                Method::GET,
-                "/api/agents/management",
-                true,
-            )
-            .await
+            let command = "config agents list";
+            let env = ConfigEnv::from_env(command)?;
+            let data = request_json(client, &env, Method::GET, "/api/agents/management", None, command).await?;
+            print_config_output(brand_agent_catalog_for_cli(data), meta(None), command, true)
         }
         ConfigAgentsCommand::Enable => {
             run_id_payload_request_with_collection_readback(
@@ -1292,6 +1291,37 @@ fn print_config_output(data: Value, meta: Value, command: &str, redact_output: b
     print_envelope(data, meta, command)
 }
 
+/// Keep the in-process runtime identifier stable internally while preventing
+/// agent-facing configuration output from leaking the upstream AionRS brand.
+fn brand_agent_catalog_for_cli(value: Value) -> Value {
+    match value {
+        Value::Object(mut object) => {
+            let is_zigo_runtime = object.get("agent_type").and_then(Value::as_str) == Some("aionrs")
+                || object.get("backend").and_then(Value::as_str) == Some("aionrs");
+            for value in object.values_mut() {
+                *value = brand_agent_catalog_for_cli(std::mem::take(value));
+            }
+            if is_zigo_runtime {
+                object.insert("name".into(), Value::String("Zigo CLI".into()));
+                if object.contains_key("agent_type") {
+                    object.insert("agent_type".into(), Value::String("zigo".into()));
+                }
+                if object.get("backend").and_then(Value::as_str) == Some("aionrs") {
+                    object.insert("backend".into(), Value::String("zigo".into()));
+                }
+                if let Some(Value::Object(names)) = object.get_mut("name_i18n") {
+                    for name in names.values_mut() {
+                        *name = Value::String("Zigo CLI".into());
+                    }
+                }
+            }
+            Value::Object(object)
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(brand_agent_catalog_for_cli).collect()),
+        other => other,
+    }
+}
+
 enum ReadBack {
     None,
 }
@@ -1625,30 +1655,44 @@ fn extract_api_data(value: Value, command: &str) -> Result<Value, ConfigError> {
 }
 
 fn read_stdin_payload(command: &str) -> Result<Value, ConfigError> {
-    let mut raw = String::new();
-    io::stdin().read_to_string(&mut raw).map_err(|_| {
-        ConfigError::new(
-            ConfigErrorCode::PayloadInvalid,
-            command,
-            "failed to read JSON payload from stdin",
+    let input_file = CONFIG_INPUT_FILE.get().and_then(|path| path.as_ref());
+    let (mut raw, field) = if let Some(path) = input_file {
+        (
+            fs::read_to_string(path).map_err(|_| {
+                ConfigError::new(
+                    ConfigErrorCode::PayloadInvalid,
+                    command,
+                    "failed to read JSON payload from input file",
+                )
+                .field("field", "input_file")
+            })?,
+            "input_file",
         )
-        .field("field", "stdin")
-    })?;
+    } else {
+        let mut raw = String::new();
+        io::stdin().read_to_string(&mut raw).map_err(|_| {
+            ConfigError::new(
+                ConfigErrorCode::PayloadInvalid,
+                command,
+                "failed to read JSON payload from stdin",
+            )
+            .field("field", "stdin")
+        })?;
+        (raw, "stdin")
+    };
+    // PowerShell 5 writes a UTF-8 BOM for `Set-Content -Encoding UTF8`.
+    // Accept it so Windows agents do not enter a retry loop over valid JSON.
+    if raw.starts_with('\u{feff}') {
+        raw.remove(0);
+    }
     if raw.trim().is_empty() {
-        return Err(ConfigError::new(
-            ConfigErrorCode::PayloadMissing,
-            command,
-            "JSON payload is required on stdin",
-        )
-        .field("field", "stdin"));
+        return Err(
+            ConfigError::new(ConfigErrorCode::PayloadMissing, command, "JSON payload is required")
+                .field("field", field),
+        );
     }
     serde_json::from_str(&raw).map_err(|_| {
-        ConfigError::new(
-            ConfigErrorCode::PayloadInvalid,
-            command,
-            "invalid JSON payload on stdin",
-        )
-        .field("field", "stdin")
+        ConfigError::new(ConfigErrorCode::PayloadInvalid, command, "invalid JSON payload").field("field", field)
     })
 }
 

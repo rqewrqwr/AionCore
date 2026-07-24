@@ -1273,7 +1273,18 @@ pub async fn delete_skill_with_repo_for_owner(
 /// Check whether a skill name exists in the built-in corpus — either as
 /// a top-level opt-in skill or under `auto-inject/`. Consults the
 /// on-disk tree at `paths.builtin_skills_dir`.
+fn canonical_builtin_skill_name(skill_name: &str) -> &str {
+    match skill_name {
+        "aionui-config" => "zigo-config",
+        "aionui-troubleshooting" => "zigo-troubleshooting",
+        "aionui-webui-public" => "zigo-webui-public",
+        "aionui-webui-setup" => "zigo-webui-setup",
+        _ => skill_name,
+    }
+}
+
 fn builtin_skill_exists(paths: &SkillPaths, skill_name: &str) -> bool {
+    let skill_name = canonical_builtin_skill_name(skill_name);
     paths.builtin_skills_dir.join(skill_name).is_dir()
         || paths
             .builtin_skills_dir
@@ -1328,24 +1339,26 @@ pub async fn materialize_skills_for_agent(
     validate_filename(conversation_id)?;
 
     let mut resolved = Vec::with_capacity(skills.len());
-    for name in skills {
-        if name.is_empty() {
+    for requested_name in skills {
+        if requested_name.is_empty() {
             continue;
         }
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
-            warn!(skill = %name, "skipping skill with invalid name");
+        if requested_name.contains('/') || requested_name.contains('\\') || requested_name.contains("..") {
+            warn!(skill = %requested_name, "skipping skill with invalid name");
             continue;
         }
+        let name = canonical_builtin_skill_name(requested_name);
         match resolve_skill_source_path(paths, name).await? {
             Some(source_path) => resolved.push(ResolvedAgentSkill {
-                name: name.clone(),
+                name: name.to_owned(),
                 source_path,
             }),
-            None => warn!(skill = %name, "skill not found in any source"),
+            None => warn!(skill = %requested_name, "skill not found in any source"),
         }
     }
 
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    resolved.dedup_by(|a, b| a.name == b.name);
     Ok(resolved)
 }
 
@@ -1369,24 +1382,26 @@ pub async fn materialize_skills_for_agent_with_repo_for_owner(
     validate_filename(conversation_id)?;
 
     let mut resolved = Vec::with_capacity(skills.len());
-    for name in skills {
-        if name.is_empty() {
+    for requested_name in skills {
+        if requested_name.is_empty() {
             continue;
         }
-        if name.contains('/') || name.contains('\\') || name.contains("..") {
-            warn!(skill = %name, "skipping skill with invalid name");
+        if requested_name.contains('/') || requested_name.contains('\\') || requested_name.contains("..") {
+            warn!(skill = %requested_name, "skipping skill with invalid name");
             continue;
         }
+        let name = canonical_builtin_skill_name(requested_name);
         match resolve_skill_source_path_with_repo(paths, repo, owner_user_id, name).await? {
             Some(source_path) => resolved.push(ResolvedAgentSkill {
-                name: name.clone(),
+                name: name.to_owned(),
                 source_path,
             }),
-            None => warn!(skill = %name, "skill not found in any source"),
+            None => warn!(skill = %requested_name, "skill not found in any source"),
         }
     }
 
     resolved.sort_by(|a, b| a.name.cmp(&b.name));
+    resolved.dedup_by(|a, b| a.name == b.name);
     Ok(resolved)
 }
 
@@ -1694,28 +1709,62 @@ pub async fn sync_skill_catalog_into_repo(
 }
 
 async fn sync_builtin_skills_into_repo(paths: &SkillPaths, repo: &dyn ISkillRepository) -> Result<(), ExtensionError> {
-    if let Ok(skills) = scan_skill_dirs(&paths.builtin_skills_dir).await {
+    let mut builtin_names = std::collections::HashSet::new();
+    let builtin_scan = scan_skill_dirs(&paths.builtin_skills_dir).await;
+    if let Ok(skills) = &builtin_scan {
         for skill in skills {
             if skill.name == BUILTIN_AUTO_SKILLS_SUBDIR {
                 continue;
             }
-            sync_managed_skill_into_repo(repo, &skill, "builtin").await?;
+            builtin_names.insert(skill.name.clone());
+            sync_managed_skill_into_repo(repo, skill, "builtin").await?;
         }
     }
 
     let auto_inject_dir = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR);
-    if let Ok(skills) = scan_skill_dirs(&auto_inject_dir).await {
+    let auto_inject_scan = scan_skill_dirs(&auto_inject_dir).await;
+    if let Ok(skills) = &auto_inject_scan {
         for skill in skills {
-            sync_managed_skill_into_repo(repo, &skill, "builtin").await?;
+            builtin_names.insert(skill.name.clone());
+            sync_managed_skill_into_repo(repo, skill, "builtin").await?;
         }
     }
-
-    if let Ok(skills) = scan_skill_dirs(&paths.cron_skills_dir).await {
-        for skill in skills {
-            sync_managed_skill_into_repo(repo, &skill, "cron").await?;
-        }
+    if builtin_scan.is_ok() && auto_inject_scan.is_ok() {
+        disable_stale_managed_skills(repo, "builtin", &builtin_names).await?;
     }
 
+    let mut cron_names = std::collections::HashSet::new();
+    let cron_scan = scan_skill_dirs(&paths.cron_skills_dir).await;
+    if let Ok(skills) = &cron_scan {
+        for skill in skills {
+            cron_names.insert(skill.name.clone());
+            sync_managed_skill_into_repo(repo, skill, "cron").await?;
+        }
+        disable_stale_managed_skills(repo, "cron", &cron_names).await?;
+    }
+
+    Ok(())
+}
+
+async fn disable_stale_managed_skills(
+    repo: &dyn ISkillRepository,
+    source: &str,
+    current_names: &std::collections::HashSet<String>,
+) -> Result<(), ExtensionError> {
+    for row in repo.list(SHARED_SKILL_OWNER).await? {
+        if row.owner_user_id != SHARED_SKILL_OWNER || row.source != source || current_names.contains(&row.name) {
+            continue;
+        }
+        repo.upsert(UpsertSkillParams {
+            owner_user_id: SHARED_SKILL_OWNER,
+            name: &row.name,
+            description: row.description.as_deref(),
+            path: &row.path,
+            source,
+            enabled: false,
+        })
+        .await?;
+    }
     Ok(())
 }
 
@@ -3064,9 +3113,47 @@ mod tests {
         create_skill_in_dir(&builtin_dir, "debug", "Debugging skill");
         create_skill_in_dir(&auto_dir, "cron", "Auto injected cron skill");
         create_skill_in_dir(&paths.cron_skills_dir, "scheduled-task", "Scheduled task skill");
+        repo.upsert(UpsertSkillParams {
+            owner_user_id: SHARED_SKILL_OWNER,
+            name: "renamed-builtin",
+            description: Some("Stale built-in skill"),
+            path: "/removed/builtin",
+            source: "builtin",
+            enabled: true,
+        })
+        .await
+        .unwrap();
+        repo.upsert(UpsertSkillParams {
+            owner_user_id: SHARED_SKILL_OWNER,
+            name: "removed-cron",
+            description: Some("Stale cron skill"),
+            path: "/removed/cron",
+            source: "cron",
+            enabled: true,
+        })
+        .await
+        .unwrap();
 
         sync_skill_catalog_into_repo(&paths, &repo).await.unwrap();
         let skills = list_available_skills_with_repo(&paths, &repo).await.unwrap();
+        assert!(!skills.iter().any(|skill| skill.name == "renamed-builtin"));
+        assert!(!skills.iter().any(|skill| skill.name == "removed-cron"));
+        assert!(
+            !repo
+                .find_by_name_any(SHARED_SKILL_OWNER, "renamed-builtin")
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
+        assert!(
+            !repo
+                .find_by_name_any(SHARED_SKILL_OWNER, "removed-cron")
+                .await
+                .unwrap()
+                .unwrap()
+                .enabled
+        );
 
         let debug = skills.iter().find(|skill| skill.name == "debug").unwrap();
         assert_eq!(debug.source, SkillSource::Builtin);
@@ -3606,6 +3693,38 @@ mod tests {
         assert_eq!(resolved[0].name, "mermaid");
         let expected = paths.builtin_skills_dir.join("mermaid");
         assert_eq!(resolved[0].source_path, expected);
+    }
+
+    #[tokio::test]
+    async fn materialize_migrates_legacy_aionui_skill_names_without_duplicates() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_embedded_paths(tmp.path()).await;
+
+        let resolved = materialize_skills_for_agent(
+            &paths,
+            "conv-legacy-brand",
+            &[
+                "aionui-config".to_owned(),
+                "zigo-config".to_owned(),
+                "aionui-troubleshooting".to_owned(),
+                "aionui-webui-public".to_owned(),
+                "aionui-webui-setup".to_owned(),
+            ],
+        )
+        .await
+        .unwrap();
+
+        let names = resolved.iter().map(|skill| skill.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                "zigo-config",
+                "zigo-troubleshooting",
+                "zigo-webui-public",
+                "zigo-webui-setup",
+            ]
+        );
+        assert!(resolved.iter().all(|skill| skill.source_path.is_dir()));
     }
 
     #[tokio::test]

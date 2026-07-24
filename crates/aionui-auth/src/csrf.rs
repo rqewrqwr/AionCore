@@ -13,12 +13,16 @@ use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
 
 use crate::cookie::CookieConfig;
 use crate::extract::extract_cookie_value;
+use crate::middleware::{PRIVATE_ASSET_GATEWAY_SECRET_ENV, private_asset_gateway_is_trusted};
 
 /// CSRF protection middleware using the Double Submit Cookie pattern.
 ///
 /// Behavior:
 /// - Safe methods (GET, HEAD, OPTIONS) bypass validation.
 /// - Exempt paths (`/login`, `/api/auth/qr-login`) bypass validation.
+/// - Requests from the authenticated loopback private-asset gateway bypass
+///   browser CSRF validation; the gateway is authenticated with a separate
+///   process secret that is never inherited by Agent subprocesses.
 /// - All other requests must include an `x-csrf-token` header whose value
 ///   matches the `aionui-csrf-token` cookie.
 /// - Sets the CSRF cookie on responses if the client does not have one.
@@ -36,8 +40,10 @@ pub async fn csrf_middleware(
     // Validate CSRF for state-changing requests
     let needs_validation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
     let is_exempt = path == "/login" || path == "/api/auth/qr-login";
+    let private_gateway_secret = std::env::var(PRIVATE_ASSET_GATEWAY_SECRET_ENV).ok();
+    let is_trusted_private_gateway = private_asset_gateway_is_trusted(&request, private_gateway_secret.as_deref());
 
-    if needs_validation && !is_exempt {
+    if needs_validation && !is_exempt && !is_trusted_private_gateway {
         let header_token = request
             .headers()
             .get(CSRF_HEADER_NAME)

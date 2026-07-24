@@ -553,15 +553,41 @@ async fn refresh_handler(
 ) -> Result<Json<RefreshResponse>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
 
-    let payload = state
-        .jwt_service
-        .verify(&req.token)
-        .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+    let (user_id, new_token) = match state.jwt_service.verify(&req.token) {
+        Ok(payload) if payload.scope.as_deref() == Some(crate::AGENT_SKILL_CONFIG_SCOPE) => {
+            let credential = state
+                .jwt_service
+                .renew_agent_skill_config(&req.token)
+                .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+            (payload.user_id, credential.token)
+        }
+        Ok(payload) => {
+            let token = state
+                .jwt_service
+                .sign(&payload.user_id, &payload.username)
+                .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+            (payload.user_id, token)
+        }
+        Err(AuthError::TokenExpired) => {
+            let credential = state
+                .jwt_service
+                .renew_agent_skill_config(&req.token)
+                .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+            let payload = state
+                .jwt_service
+                .verify(&credential.token)
+                .map_err(|_| ApiError::Unauthorized("Invalid or expired token".into()))?;
+            (payload.user_id, credential.token)
+        }
+        Err(_) => return Err(ApiError::Unauthorized("Invalid or expired token".into())),
+    };
 
-    let new_token = state
-        .jwt_service
-        .sign(&payload.user_id, &payload.username)
-        .map_err(|e| ApiError::Internal(format!("Token signing error: {e}")))?;
+    state
+        .user_repo
+        .find_by_id(&user_id)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Database error: {e}")))?
+        .ok_or_else(|| ApiError::Unauthorized("Invalid authentication subject".into()))?;
 
     Ok(Json(RefreshResponse {
         success: true,

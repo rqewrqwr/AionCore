@@ -1,4 +1,5 @@
 mod error;
+mod skill_bridge;
 
 pub mod agent;
 pub mod history_sanitize;

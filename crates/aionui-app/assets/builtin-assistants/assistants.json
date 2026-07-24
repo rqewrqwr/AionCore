@@ -2,6 +2,69 @@
   "version": "1.0.0",
   "assistants": [
     {
+      "id": "workflow-assistant",
+      "sort_order": 5,
+      "default_enabled": true,
+      "name": "Workflow Assistant",
+      "name_i18n": {
+        "en-US": "Workflow Assistant",
+        "zh-CN": "工作流助手",
+        "ru-RU": "Помощник по рабочим процессам",
+        "uk-UA": "Помічник із робочих процесів"
+      },
+      "description": "Build, update, publish, run, and troubleshoot your Zigo workflows through the secure workflow MCP.",
+      "description_i18n": {
+        "en-US": "Build, update, publish, run, and troubleshoot your Zigo workflows through the secure workflow MCP.",
+        "zh-CN": "通过安全的工作流 MCP 创建、修改、发布、运行和排查你的 Zigo 工作流。",
+        "ru-RU": "Создавайте, обновляйте, публикуйте, запускайте и диагностируйте свои рабочие процессы Zigo через защищённый MCP.",
+        "uk-UA": "Створюйте, оновлюйте, публікуйте, запускайте та діагностуйте свої робочі процеси Zigo через захищений MCP."
+      },
+      "avatar": "🔀",
+      "agent_ref": "aionrs",
+      "enabled_skills": [
+        "zigo-workflows"
+      ],
+      "custom_skill_names": [],
+      "disabled_builtin_skills": [],
+      "default_mcp_ids": [
+        "zigo_builtin_n8n_workflows"
+      ],
+      "rule_file": "rules/workflow-assistant.{locale}.md",
+      "prompts": [
+        "Create a customer feedback workflow that classifies sentiment and sends urgent issues to the support team",
+        "Show my published workflows and explain which ones have automatic triggers enabled",
+        "Run my weekly report workflow with the latest input and summarize the execution result",
+        "Find the cause of the latest failed workflow execution and suggest a safe fix"
+      ],
+      "prompts_i18n": {
+        "en-US": [
+          "Create a customer feedback workflow that classifies sentiment and sends urgent issues to the support team",
+          "Show my published workflows and explain which ones have automatic triggers enabled",
+          "Run my weekly report workflow with the latest input and summarize the execution result",
+          "Find the cause of the latest failed workflow execution and suggest a safe fix"
+        ],
+        "zh-CN": [
+          "创建一个客户反馈工作流：自动判断情绪，并把紧急问题发送给客服团队",
+          "列出我已发布的工作流，并说明哪些工作流开启了自动触发",
+          "用最新输入运行我的周报工作流，并总结执行结果",
+          "排查最近一次失败的工作流执行，并给出安全的修复建议"
+        ],
+        "ru-RU": [
+          "Создай рабочий процесс для отзывов клиентов: определяй тональность и отправляй срочные обращения команде поддержки",
+          "Покажи мои опубликованные рабочие процессы и объясни, для каких включены автоматические триггеры",
+          "Запусти мой процесс еженедельного отчёта с последними входными данными и подведи итог выполнения",
+          "Найди причину последнего сбоя рабочего процесса и предложи безопасное исправление"
+        ],
+        "uk-UA": [
+          "Створи робочий процес для відгуків клієнтів: визначай тональність і надсилай термінові звернення команді підтримки",
+          "Покажи мої опубліковані робочі процеси та поясни, для яких увімкнені автоматичні тригери",
+          "Запусти мій процес щотижневого звіту з останніми вхідними даними та підсумуй результат виконання",
+          "Знайди причину останнього збою робочого процесу та запропонуй безпечне виправлення"
+        ]
+      },
+      "models": []
+    },
+    {
       "id": "word-creator",
       "sort_order": 10,
       "default_enabled": false,
@@ -505,7 +568,7 @@
       "agent_ref": "aionrs",
       "enabled_skills": [
         "openclaw-setup",
-        "aionui-webui-setup"
+        "zigo-webui-setup"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
@@ -1090,58 +1153,58 @@
       "id": "aionui-assistant",
       "sort_order": 0,
       "default_enabled": true,
-      "name": "AionUi Butler",
+      "name": "Zigo Butler",
       "name_i18n": {
-        "en-US": "AionUi Butler",
-        "zh-CN": "AionUi管家",
-        "ru-RU": "Дворецкий AionUi",
-        "uk-UA": "Дворецький AionUi"
+        "en-US": "Zigo Butler",
+        "zh-CN": "Zigo管家",
+        "ru-RU": "Дворецкий Zigo",
+        "uk-UA": "Дворецький Zigo"
       },
-      "description": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+      "description": "Your all-in-one Zigo butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach Zigo from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
       "description_i18n": {
-        "en-US": "Your all-in-one AionUi butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach AionUi from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
-        "zh-CN": "你的 AionUi 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 AionUi、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
-        "ru-RU": "Ваш универсальный дворецкий AionUi: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать AionUi с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
-        "uk-UA": "Ваш універсальний дворецький AionUi: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати AionUi з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
+        "en-US": "Your all-in-one Zigo butler: set up assistants, skills, MCP servers and LLM providers; set up remote access so you can reach Zigo from your phone or share a link; and diagnose problems like stuck conversations, failing models, or a scheduled task that didn't run.",
+        "zh-CN": "你的 Zigo 全能管家：配置助手、技能、MCP 服务器与 LLM 模型；设置远程访问，让你在手机或外网也能打开 Zigo、生成分享链接；还能诊断卡住的会话、失败的模型调用，或定时任务为何没执行。",
+        "ru-RU": "Ваш универсальный дворецкий Zigo: настройка ассистентов, навыков, серверов MCP и провайдеров LLM; настройка удалённого доступа, чтобы открывать Zigo с телефона или делиться ссылкой; и диагностика проблем — зависших разговоров, сбоев моделей или почему не выполнилась запланированная задача.",
+        "uk-UA": "Ваш універсальний дворецький Zigo: налаштування асистентів, навичок, серверів MCP і провайдерів LLM; налаштування віддаленого доступу, щоб відкривати Zigo з телефона або ділитися посиланням; і діагностика проблем — зависань розмов, збоїв моделей або чому не виконалося заплановане завдання."
       },
       "avatar": "avatars/aionui-assistant.jpg",
       "agent_ref": "aionrs",
       "enabled_skills": [
-        "aionui-config",
-        "aionui-troubleshooting",
-        "aionui-webui-public"
+        "zigo-config",
+        "zigo-troubleshooting",
+        "zigo-webui-public"
       ],
       "custom_skill_names": [],
       "disabled_builtin_skills": [],
       "rule_file": "rules/aionui-assistant.{locale}.md",
       "prompts": [
         "Add a new LLM provider and API key, then set it as the default model",
-        "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+        "Set up remote access for me, so I can open Zigo from my phone when I'm out",
         "A conversation is stuck — please diagnose what's wrong",
         "Create a new assistant and attach a skill to it"
       ],
       "prompts_i18n": {
         "en-US": [
           "Add a new LLM provider and API key, then set it as the default model",
-          "Set up remote access for me, so I can open AionUi from my phone when I'm out",
+          "Set up remote access for me, so I can open Zigo from my phone when I'm out",
           "A conversation is stuck — please diagnose what's wrong",
           "Create a new assistant and attach a skill to it"
         ],
         "zh-CN": [
           "添加一个新的 LLM 模型和 API Key，并设为默认模型",
-          "帮我配置远程访问，让我在外面用手机也能打开 AionUi",
+          "帮我配置远程访问，让我在外面用手机也能打开 Zigo",
           "有个会话卡住了，帮我诊断哪里出了问题",
           "创建一个新助手，并给它绑定一个技能"
         ],
         "ru-RU": [
           "Добавь нового провайдера LLM и API-ключ, затем сделай его моделью по умолчанию",
-          "Настрой удалённый доступ, чтобы я мог открывать AionUi с телефона, когда меня нет",
+          "Настрой удалённый доступ, чтобы я мог открывать Zigo с телефона, когда меня нет",
           "Разговор завис — пожалуйста, диагностируй, что не так",
           "Создай нового ассистента и подключи к нему навык"
         ],
         "uk-UA": [
           "Додай нового провайдера LLM та API-ключ, потім зроби його моделлю за замовчуванням",
-          "Налаштуй віддалений доступ, щоб я міг відкривати AionUi з телефона, коли мене немає",
+          "Налаштуй віддалений доступ, щоб я міг відкривати Zigo з телефона, коли мене немає",
           "Розмова зависла — будь ласка, діагностуй, що не так",
           "Створи нового асистента й підключи до нього навичку"
         ]
