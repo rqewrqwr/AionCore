@@ -2,7 +2,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
-use tracing::info;
+use tracing::{info, warn};
 
 /// Stage Zigo's branded workspace skills for the upstream AionRS loader.
 ///
@@ -53,7 +53,17 @@ fn copy_dir_recursive<'a>(
         while let Some(entry) = entries.next_entry().await? {
             let source_path = entry.path();
             let destination_path = destination.join(entry.file_name());
-            let metadata = tokio::fs::metadata(&source_path).await?;
+            let metadata = match tokio::fs::metadata(&source_path).await {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    warn!(
+                        source = %source_path.display(),
+                        "Skipping a dangling Zigo skill link while staging"
+                    );
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             if metadata.is_dir() {
                 copy_dir_recursive(&source_path, &destination_path).await?;
             } else if metadata.is_file() {
