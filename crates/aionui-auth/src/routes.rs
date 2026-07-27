@@ -10,7 +10,7 @@ use axum::middleware::from_fn_with_state;
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Extension, Router};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use aionui_api_types::{
     ApiResponse, AuthStatusResponse, ChangePasswordRequest, LoginRequest, LoginResponse, PublicUser, QrLoginRequest,
@@ -193,6 +193,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
     let authenticated = Router::new()
         .route("/logout", post(logout_handler))
         .route("/api/auth/user", get(user_handler))
+        .route("/api/users", get(users_handler))
         .route("/api/auth/change-password", post(change_password_handler))
         .route("/api/ws-token", get(ws_token_handler))
         .route_layer(from_fn_with_state(
@@ -484,6 +485,39 @@ async fn user_handler(Extension(user): Extension<CurrentUser>) -> Json<UserInfoR
             username: user.username,
         },
     })
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct LegacyUserResponse {
+    id: String,
+    user_id: String,
+    name: String,
+    email: String,
+    role: &'static str,
+    status: &'static str,
+}
+
+// Compatibility endpoint consumed by the ported workspace. Keep the response
+// intentionally limited to public identity fields; never expose User records.
+async fn users_handler(State(state): State<AuthRouterState>) -> Result<Json<Vec<LegacyUserResponse>>, ApiError> {
+    let users = state.user_repo.list_users().await.map_err(db_error_to_api_error)?;
+    Ok(Json(
+        users
+            .into_iter()
+            .map(|user| {
+                let email = user.email.unwrap_or_else(|| user.username.clone());
+                LegacyUserResponse {
+                    id: user.id.clone(),
+                    user_id: user.id,
+                    name: user.username,
+                    email,
+                    role: "USER",
+                    status: "ACTIVE",
+                }
+            })
+            .collect(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

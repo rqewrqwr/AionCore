@@ -23,6 +23,7 @@ pub use crate::state::AssistantRouterState;
 pub fn assistant_routes(state: AssistantRouterState) -> Router {
     Router::new()
         .route("/api/assistants", get(list).post(create))
+        .route("/api/platform/assistants/all", get(list))
         .route("/api/assistants/{id}", get(get_one).put(update).delete(delete_one))
         .route("/api/assistants/{id}/state", patch(set_state))
         .route("/api/assistants/{id}/avatar", get(get_avatar))
