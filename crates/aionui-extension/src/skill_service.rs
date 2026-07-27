@@ -1437,7 +1437,35 @@ pub async fn link_workspace_skills(
             let target = target_skills_dir.join(&skill.name);
             match tokio::fs::symlink_metadata(&target).await {
                 // Target already exists — leave it alone.
-                Ok(_) => continue,
+                Ok(metadata) => {
+                    // Persisted workspaces can outlive the builtin-skill
+                    // directory they originally pointed at. Replace dangling
+                    // links before the runtime traverses the skills tree.
+                    if !metadata.file_type().is_symlink() {
+                        continue;
+                    }
+                    match tokio::fs::metadata(&target).await {
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                            if let Err(remove_error) = remove_directory_symlink(&target).await {
+                                warn!(
+                                    target = %target.display(),
+                                    error = %remove_error,
+                                    "skipping skill link: failed to remove dangling target"
+                                );
+                                continue;
+                            }
+                        }
+                        Err(e) => {
+                            warn!(
+                                target = %target.display(),
+                                error = %e,
+                                "skipping skill link: failed to resolve existing target"
+                            );
+                            continue;
+                        }
+                    }
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                 Err(e) => {
                     warn!(
@@ -1469,6 +1497,16 @@ pub async fn link_workspace_skills(
         }
     }
     Ok(created)
+}
+
+#[cfg(unix)]
+async fn remove_directory_symlink(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::remove_file(path).await
+}
+
+#[cfg(windows)]
+async fn remove_directory_symlink(path: &Path) -> Result<(), std::io::Error> {
+    tokio::fs::remove_dir(path).await
 }
 
 async fn resolve_workspace_skills_dir(workspace: &Path, skills_rel_dir: &str) -> PathBuf {
@@ -3942,6 +3980,31 @@ mod tests {
             !singular_dir.join("my-skill").exists(),
             "singular sibling should remain untouched when requested dir exists"
         );
+    }
+
+    #[tokio::test]
+    async fn link_workspace_skills_replaces_dangling_directory_link() {
+        let tmp = TempDir::new().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let target_dir = workspace.join(".zigo").join("skills");
+        std::fs::create_dir_all(&target_dir).unwrap();
+
+        let stale_root = tmp.path().join("stale-sources");
+        let stale_skill = create_resolved_test_skill(&stale_root, "zigo-config");
+        let target = target_dir.join("zigo-config");
+        create_symlink(&stale_skill.source_path, &target).await.unwrap();
+        std::fs::remove_dir_all(&stale_skill.source_path).unwrap();
+        assert!(std::fs::symlink_metadata(&target).is_ok());
+        assert!(!target.exists());
+
+        let fresh_root = tmp.path().join("fresh-sources");
+        let fresh_skill = create_resolved_test_skill(&fresh_root, "zigo-config");
+        let created = link_workspace_skills(&workspace, &[".zigo/skills"], &[fresh_skill])
+            .await
+            .expect("dangling link should be replaced");
+
+        assert_eq!(created, 1);
+        assert!(target.join(SKILL_MANIFEST_FILE).is_file());
     }
 
     /// Windows-only: directory linking must go through an NTFS junction
