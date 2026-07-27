@@ -51,6 +51,31 @@ async fn insert_message(
         .unwrap();
 }
 
+async fn insert_cached_assistant_message(
+    services: &aionui_app::AppServices,
+    conv_id: &str,
+    msg_id: &str,
+    message_type: &str,
+) {
+    let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
+    let msg = aionui_db::models::MessageRow {
+        id: msg_id.into(),
+        conversation_id: conv_id.into(),
+        msg_id: Some(msg_id.into()),
+        r#type: message_type.into(),
+        content: json!({
+            "content": "Original",
+            "localized_content": { "zh-CN": "已有中文" }
+        })
+        .to_string(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 1000,
+    };
+    IConversationRepository::insert_message(&repo, &msg).await.unwrap();
+}
+
 async fn update_conversation_workspace(services: &aionui_app::AppServices, conv_id: &str, workspace: &str) {
     let repo = aionui_db::SqliteConversationRepository::new(services.database.pool().clone());
     IConversationRepository::update(
@@ -915,4 +940,85 @@ async fn t2_3b_runtime_ensure_legacy_workspace_with_whitespace_succeeds() {
     );
     let resp = app.oneshot(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn message_translation_routes_return_cached_content() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Translation").await;
+    insert_cached_assistant_message(&services, &conv_id, "answer-1", "text").await;
+    insert_cached_assistant_message(&services, &conv_id, "thinking-1", "thinking").await;
+
+    for path in [
+        format!("/api/conversations/{conv_id}/messages/answer-1/translation"),
+        format!("/api/conversations/{conv_id}/messages/thinking-1/thinking-translation"),
+    ] {
+        let request = common::json_with_token("POST", &path, json!({ "locale": "zh-CN" }), &token, &csrf);
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"]["content"], "已有中文");
+        assert_eq!(body["data"]["cached"], true);
+        assert_eq!(body["data"]["terminal"], true);
+    }
+}
+
+#[tokio::test]
+async fn message_translation_requires_auth_and_csrf() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Translation auth").await;
+    insert_cached_assistant_message(&services, &conv_id, "answer-1", "text").await;
+    let path = format!("/api/conversations/{conv_id}/messages/answer-1/translation");
+
+    let unauthenticated = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"locale":"zh-CN"}"#))
+        .unwrap();
+    assert_eq!(
+        app.clone().oneshot(unauthenticated).await.unwrap().status(),
+        StatusCode::FORBIDDEN
+    );
+
+    let missing_csrf = axum::http::Request::builder()
+        .method("POST")
+        .uri(&path)
+        .header("content-type", "application/json")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::from(r#"{"locale":"zh-CN"}"#))
+        .unwrap();
+    assert_eq!(app.oneshot(missing_csrf).await.unwrap().status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn message_translation_hides_cross_user_messages_and_validates_type() {
+    let (mut app, services) = build_app().await;
+    let (owner_token, owner_csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let conv_id = create_conversation(&mut app, &owner_token, &owner_csrf, "Translation owner").await;
+    insert_cached_assistant_message(&services, &conv_id, "answer-1", "text").await;
+
+    let wrong_type = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages/answer-1/thinking-translation"),
+        json!({ "locale": "zh-CN" }),
+        &owner_token,
+        &owner_csrf,
+    );
+    assert_eq!(
+        app.clone().oneshot(wrong_type).await.unwrap().status(),
+        StatusCode::BAD_REQUEST
+    );
+
+    let (other_token, other_csrf) = setup_and_login(&mut app, &services, "other-user", "StrongP@ss2").await;
+    let cross_user = common::json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages/answer-1/translation"),
+        json!({ "locale": "zh-CN" }),
+        &other_token,
+        &other_csrf,
+    );
+    assert_eq!(app.oneshot(cross_user).await.unwrap().status(), StatusCode::NOT_FOUND);
 }

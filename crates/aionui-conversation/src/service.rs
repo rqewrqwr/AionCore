@@ -7,6 +7,7 @@ use aionui_ai_agent::session_context::{AgentSessionContext, AgentSessionKind};
 use aionui_ai_agent::types::BuildTaskOptions;
 use aionui_ai_agent::{
     ActiveLeaseRegistry, AgentAvailabilityFeedbackPort, AgentError, AgentInstance, AgentSendError, IWorkerTaskManager,
+    MessageTranslationPort,
 };
 use aionui_auth::JwtService;
 
@@ -21,8 +22,9 @@ use aionui_api_types::{
     ConversationMcpStatusKind, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
     EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery, MessageListResponse, MessageResponse,
     MessageSearchResponse, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TeamSessionBinding, UpdateConversationArtifactRequest, UpdateConversationRequest,
-    WebSocketMessage, assistant_avatar_response_value, assistant_avatar_response_value_with_version,
+    SessionMcpTransport, TeamSessionBinding, TranslateMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    assistant_avatar_response_value_with_version,
 };
 use aionui_common::{
     AgentKillReason, AgentType, ConversationSource, ConversationStatus, ErrorChain, MessageType, OnConversationDelete,
@@ -320,6 +322,7 @@ pub struct ConversationService {
     assistant_dispatcher: Arc<RwLock<Option<Arc<dyn AssistantRuleDispatcher>>>>,
     agent_availability_feedback: Arc<RwLock<Option<Arc<dyn AgentAvailabilityFeedbackPort>>>>,
     workspace_access: Arc<RwLock<Option<Arc<dyn WorkspaceAccessPort>>>>,
+    message_translation: Arc<RwLock<Option<Arc<dyn MessageTranslationPort>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -395,6 +398,7 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             workspace_access: Arc::new(RwLock::new(None)),
+            message_translation: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -456,6 +460,12 @@ impl ConversationService {
     pub fn with_assistant_preference_repo(&self, repo: Arc<dyn IAssistantPreferenceRepository>) {
         if let Ok(mut guard) = self.assistant_preference_repo.write() {
             *guard = Some(repo);
+        }
+    }
+
+    pub fn with_message_translation(&self, translation: Arc<dyn MessageTranslationPort>) {
+        if let Ok(mut guard) = self.message_translation.write() {
+            *guard = Some(translation);
         }
     }
 
@@ -2442,6 +2452,132 @@ impl ConversationService {
         }
 
         Ok(response)
+    }
+
+    /// Translate one persisted, terminal assistant text or thinking message.
+    pub async fn translate_message(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        message_id: &str,
+        expected_type: &str,
+        locale: &str,
+    ) -> Result<TranslateMessageResponse, ConversationError> {
+        if locale != "zh-CN" {
+            return Err(ConversationError::bad_request("Only the zh-CN locale is supported"));
+        }
+
+        let conversation = self
+            .conversation_repo
+            .get(conversation_id)
+            .await?
+            .filter(|row| row.user_id == user_id)
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let row = self
+            .conversation_repo
+            .get_message(conversation_id, message_id)
+            .await?
+            .ok_or_else(|| ConversationError::MessageNotFound {
+                id: message_id.to_owned(),
+            })?;
+
+        if row.r#type != expected_type || row.position.as_deref() == Some("right") {
+            return Err(ConversationError::bad_request(format!(
+                "Message {message_id} is not an assistant {expected_type} message"
+            )));
+        }
+        let terminal = !matches!(row.status.as_deref(), Some("work" | "pending"));
+        if !terminal {
+            return Err(ConversationError::Busy {
+                reason: "The message is still streaming".into(),
+            });
+        }
+
+        let mut content: serde_json::Value = serde_json::from_str(&row.content)
+            .map_err(|error| ConversationError::internal(format!("Invalid message content: {error}")))?;
+        let source = content
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| ConversationError::bad_request("Message content is empty"))?
+            .to_owned();
+        const MAX_TRANSLATION_SOURCE_CHARS: usize = 100_000;
+        let source_length = source.chars().count();
+        if source_length > MAX_TRANSLATION_SOURCE_CHARS {
+            return Err(ConversationError::bad_request(format!(
+                "Message content exceeds the {MAX_TRANSLATION_SOURCE_CHARS} character translation limit"
+            )));
+        }
+
+        if let Some(cached) = content
+            .get("localized_content")
+            .and_then(|value| value.get(locale))
+            .and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Ok(TranslateMessageResponse {
+                content: cached.to_owned(),
+                cached: true,
+                source_length,
+                terminal,
+            });
+        }
+
+        let translation = self
+            .message_translation
+            .read()
+            .ok()
+            .and_then(|guard| guard.clone())
+            .ok_or_else(|| ConversationError::BadGateway {
+                reason: "Message translation is unavailable".into(),
+            })?;
+        let preferred_model = (parse_agent_type_from_row(&conversation) == Some(AgentType::Aionrs))
+            .then(|| crate::task_options::provider_model_from_conversation_row(&conversation));
+        let translated = translation
+            .translate(user_id, preferred_model.as_ref(), &source, locale)
+            .await
+            .map_err(|error| {
+                warn!(
+                    conversation_id,
+                    message_id,
+                    error = %error,
+                    "Message translation failed"
+                );
+                ConversationError::BadGateway {
+                    reason: "Message translation failed".into(),
+                }
+            })?;
+
+        let object = content
+            .as_object_mut()
+            .ok_or_else(|| ConversationError::internal("Message content must be a JSON object"))?;
+        let localized = object
+            .entry("localized_content")
+            .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+        let localized = localized
+            .as_object_mut()
+            .ok_or_else(|| ConversationError::internal("localized_content must be a JSON object"))?;
+        localized.insert(locale.to_owned(), serde_json::Value::String(translated.clone()));
+        self.conversation_repo
+            .update_message(
+                message_id,
+                &aionui_db::MessageRowUpdate {
+                    content: Some(content.to_string()),
+                    status: None,
+                    hidden: None,
+                },
+            )
+            .await?;
+
+        Ok(TranslateMessageResponse {
+            content: translated,
+            cached: false,
+            source_length,
+            terminal,
+        })
     }
 
     /// List artifacts for a conversation with durable status state.

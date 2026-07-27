@@ -12,7 +12,8 @@ use aionui_api_types::{
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ListConversationsQuery, ListMessagesQuery,
     MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery, SendMessageRequest,
-    SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    SendMessageResponse, TranslateMessageRequest, TranslateMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -113,6 +114,14 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         .route("/api/conversations/{id}/messages/{messageId}", get(get_msg))
+        .route(
+            "/api/conversations/{id}/messages/{messageId}/thinking-translation",
+            post(translate_thinking),
+        )
+        .route(
+            "/api/conversations/{id}/messages/{messageId}/translation",
+            post(translate_answer),
+        )
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
@@ -247,6 +256,46 @@ async fn get_msg(
     let result = state
         .service
         .get_message(&user.id, &params.id, &params.message_id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(result)))
+}
+
+async fn translate_thinking(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<MessagePathParams>,
+    body: Result<Json<TranslateMessageRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TranslateMessageResponse>>, ApiError> {
+    translate_message(state, user, params, body, "thinking").await
+}
+
+async fn translate_answer(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<MessagePathParams>,
+    body: Result<Json<TranslateMessageRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<TranslateMessageResponse>>, ApiError> {
+    translate_message(state, user, params, body, "text").await
+}
+
+async fn translate_message(
+    state: ConversationRouterState,
+    user: CurrentUser,
+    params: MessagePathParams,
+    body: Result<Json<TranslateMessageRequest>, JsonRejection>,
+    expected_type: &str,
+) -> Result<Json<ApiResponse<TranslateMessageResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .service
+        .translate_message(
+            &user.id,
+            &params.id,
+            &params.message_id,
+            expected_type,
+            req.locale.trim(),
+        )
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(result)))

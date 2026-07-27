@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::{AppConfig, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
-    WorkerTaskManagerImpl, build_agent_factory,
+    MessageTranslationService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_jwt_secret};
 use aionui_common::OnConversationDelete;
@@ -94,6 +94,9 @@ impl AppServices {
             runtime_private_gateway_url: self.runtime_private_gateway_url.clone(),
             workspace_service: self.workspace_service.clone(),
             local: self.local,
+            provider_repo: Arc::new(SqliteProviderRepository::new(self.database.pool().clone())),
+            encryption_key: derive_encryption_key(&self.jwt_secret_raw),
+            data_dir: self.data_dir.clone(),
         });
         self
     }
@@ -132,7 +135,8 @@ impl AppServices {
         let encryption_key = derive_encryption_key(&secret);
         let jwt_service = Arc::new(JwtService::new(secret.clone()));
 
-        let provider_repo = Arc::new(SqliteProviderRepository::new(database.pool().clone()));
+        let provider_repo: Arc<dyn aionui_db::IProviderRepository> =
+            Arc::new(SqliteProviderRepository::new(database.pool().clone()));
         let event_bus = Arc::new(BroadcastEventBus::new(256));
         // User-configured MCP servers — injected into ACP `session/new`
         // so the agent gets the operator's tools (ELECTRON-1JG fix).
@@ -184,7 +188,7 @@ impl AppServices {
 
         let factory = build_agent_factory(AgentFactoryDeps {
             skill_manager: AcpSkillManager::new_with_repo(skill_paths.clone(), skill_repo.clone()),
-            provider_repo,
+            provider_repo: provider_repo.clone(),
             encryption_key,
             agent_registry: agent_registry.clone(),
             acp_agent_service: acp_agent_service.clone(),
@@ -222,6 +226,9 @@ impl AppServices {
             runtime_private_gateway_url: runtime_private_gateway_url.clone(),
             workspace_service: workspace_service.clone(),
             local,
+            provider_repo,
+            encryption_key,
+            data_dir: data_dir.clone(),
         });
 
         Ok(Self {
@@ -272,6 +279,9 @@ struct ConversationServiceDeps<'a> {
     runtime_private_gateway_url: Option<String>,
     workspace_service: Arc<WorkspaceService>,
     local: bool,
+    provider_repo: Arc<dyn aionui_db::IProviderRepository>,
+    encryption_key: [u8; 32],
+    data_dir: PathBuf,
 }
 
 fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> ConversationService {
@@ -303,6 +313,11 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     )));
     service.with_assistant_preference_repo(Arc::new(SqliteAssistantPreferenceRepository::new(
         deps.database.pool().clone(),
+    )));
+    service.with_message_translation(Arc::new(MessageTranslationService::new(
+        deps.provider_repo,
+        deps.encryption_key,
+        deps.data_dir,
     )));
     if let Some(hook) = deps.task_manager_delete_hook {
         service.with_delete_hook(hook);

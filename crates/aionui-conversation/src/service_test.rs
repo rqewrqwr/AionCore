@@ -14,6 +14,7 @@ use aionui_ai_agent::types::{
 };
 use aionui_ai_agent::{
     AcpError, AgentAvailabilityFeedbackPort, AgentError, AgentSendError, AgentSessionKind, IWorkerTaskManager,
+    MessageTranslationPort,
 };
 
 use aionui_api_types::{
@@ -54,6 +55,28 @@ use crate::{ConversationAgentTurnRequest, ConversationAgentTurnStatus, Conversat
 
 #[path = "service_test/acp_error_recovery_test.rs"]
 mod acp_error_recovery_test;
+
+#[derive(Default)]
+struct MockMessageTranslation {
+    calls: Mutex<Vec<(String, String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl MessageTranslationPort for MockMessageTranslation {
+    async fn translate(
+        &self,
+        user_id: &str,
+        _preferred_model: Option<&ProviderWithModel>,
+        source: &str,
+        locale: &str,
+    ) -> Result<String, AgentError> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), source.to_owned(), locale.to_owned()));
+        Ok("已翻译内容".into())
+    }
+}
 
 #[derive(Clone, Debug)]
 struct SkillLinkCall {
@@ -476,6 +499,16 @@ impl IConversationRepository for MockRepo {
         let mut messages = self.messages.lock().unwrap();
         messages.push(message.clone());
         Ok(())
+    }
+
+    async fn get_message(&self, conv_id: &str, message_id: &str) -> Result<Option<MessageRow>, aionui_db::DbError> {
+        Ok(self
+            .messages
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|message| message.conversation_id == conv_id && message.id == message_id)
+            .cloned())
     }
 
     async fn update_message(&self, id: &str, updates: &MessageRowUpdate) -> Result<(), aionui_db::DbError> {
@@ -2307,6 +2340,119 @@ async fn delete_wrong_user_returns_not_found() {
 }
 
 // ── Clone tests ───────────────────────────────────────────────────
+
+fn assistant_message(conversation_id: &str, id: &str, message_type: &str, content: serde_json::Value) -> MessageRow {
+    MessageRow {
+        id: id.into(),
+        conversation_id: conversation_id.into(),
+        msg_id: Some(id.into()),
+        r#type: message_type.into(),
+        content: content.to_string(),
+        position: Some("left".into()),
+        status: Some("finish".into()),
+        hidden: false,
+        created_at: 10,
+    }
+}
+
+#[tokio::test]
+async fn translate_message_persists_and_reuses_localized_content() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    repo.insert_message(&assistant_message(
+        &conv.id,
+        "answer-1",
+        "text",
+        json!({ "content": "Hello **world**" }),
+    ))
+    .await
+    .unwrap();
+    let translator = Arc::new(MockMessageTranslation::default());
+    svc.with_message_translation(translator.clone());
+
+    let first = svc
+        .translate_message("user_1", &conv.id, "answer-1", "text", "zh-CN")
+        .await
+        .unwrap();
+    assert_eq!(first.content, "已翻译内容");
+    assert!(!first.cached);
+    assert_eq!(first.source_length, 15);
+    assert!(first.terminal);
+
+    let second = svc
+        .translate_message("user_1", &conv.id, "answer-1", "text", "zh-CN")
+        .await
+        .unwrap();
+    assert!(second.cached);
+    assert_eq!(translator.calls.lock().unwrap().len(), 1);
+
+    let stored = repo.get_message(&conv.id, "answer-1").await.unwrap().unwrap();
+    let content: serde_json::Value = serde_json::from_str(&stored.content).unwrap();
+    assert_eq!(content["localized_content"]["zh-CN"], "已翻译内容");
+    assert_eq!(content["content"], "Hello **world**");
+}
+
+#[tokio::test]
+async fn translate_thinking_rejects_answer_message_type() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    repo.insert_message(&assistant_message(
+        &conv.id,
+        "answer-1",
+        "text",
+        json!({ "content": "Hello" }),
+    ))
+    .await
+    .unwrap();
+    svc.with_message_translation(Arc::new(MockMessageTranslation::default()));
+
+    let error = svc
+        .translate_message("user_1", &conv.id, "answer-1", "thinking", "zh-CN")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::BadRequest { .. }));
+}
+
+#[tokio::test]
+async fn translate_message_hides_cross_user_conversation() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    repo.insert_message(&assistant_message(
+        &conv.id,
+        "thinking-1",
+        "thinking",
+        json!({ "content": "Reasoning" }),
+    ))
+    .await
+    .unwrap();
+
+    let error = svc
+        .translate_message("user_2", &conv.id, "thinking-1", "thinking", "zh-CN")
+        .await
+        .unwrap_err();
+    assert!(matches!(error, ConversationError::NotFound { .. }));
+}
+
+#[tokio::test]
+async fn translate_message_rejects_nonterminal_and_unsupported_locale() {
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let conv = insert_conversation_with_type(&repo, "user_1", AgentType::Acp).await;
+    let mut message = assistant_message(&conv.id, "thinking-1", "thinking", json!({ "content": "Reasoning" }));
+    message.status = Some("work".into());
+    repo.insert_message(&message).await.unwrap();
+
+    let locale_error = svc
+        .translate_message("user_1", &conv.id, "thinking-1", "thinking", "en-US")
+        .await
+        .unwrap_err();
+    assert!(matches!(locale_error, ConversationError::BadRequest { .. }));
+
+    let streaming_error = svc
+        .translate_message("user_1", &conv.id, "thinking-1", "thinking", "zh-CN")
+        .await
+        .unwrap_err();
+    assert!(matches!(streaming_error, ConversationError::Busy { .. }));
+}
 
 #[tokio::test]
 async fn clone_without_source_creates_new() {

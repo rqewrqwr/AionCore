@@ -109,6 +109,21 @@ pub struct SendMessageResponse {
     pub runtime: ConversationRuntimeSummary,
 }
 
+/// Body for message translation endpoints.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+pub struct TranslateMessageRequest {
+    pub locale: String,
+}
+
+/// Result returned by message translation endpoints.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TranslateMessageResponse {
+    pub content: String,
+    pub cached: bool,
+    pub source_length: usize,
+    pub terminal: bool,
+}
+
 /// Body for `POST /api/conversations/:id/cancel`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CancelConversationRequest {
