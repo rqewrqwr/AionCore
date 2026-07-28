@@ -1100,6 +1100,50 @@ async fn upload_accepts_small_png_and_returns_readable_path() {
 }
 
 #[tokio::test]
+async fn upload_can_write_directly_into_a_nested_workspace_folder() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "workspace-uploader", "StrongP@ss1").await;
+
+    let user = services
+        .user_repo
+        .find_by_username("workspace-uploader")
+        .await
+        .unwrap()
+        .unwrap();
+    let workspace = services
+        .workspace_service
+        .create_personal(&user.id, "Upload test")
+        .await
+        .unwrap();
+    let workspace_root = services
+        .work_dir
+        .join("workspaces")
+        .join(workspace.id.get(..2).unwrap_or("00"))
+        .join(&workspace.id)
+        .join("root");
+    let target_folder = workspace_root.join("docs");
+    std::fs::create_dir_all(&target_folder).unwrap();
+    let file_name = "workspace-note.txt";
+    let bytes = b"workspace upload".to_vec();
+    let (content_type, body) = UploadMultipart::new()
+        .add_file("file", file_name, "text/plain", &bytes)
+        .add_text("workspace_root", &workspace_root.to_string_lossy())
+        .add_text("target_folder", &target_folder.to_string_lossy())
+        .build();
+
+    let req = upload_request(&content_type, body, &token, &csrf);
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let json = body_json(resp).await;
+    let path = json["data"].as_str().unwrap();
+    assert_eq!(std::path::Path::new(path), target_folder.join(file_name));
+    assert_eq!(std::fs::read(path).unwrap(), bytes);
+
+    let _ = std::fs::remove_dir_all(workspace_root);
+}
+
+#[tokio::test]
 async fn upload_uses_content_disposition_filename_when_file_name_missing() {
     let (mut app, services) = build_app().await;
     let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;

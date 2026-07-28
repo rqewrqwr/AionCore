@@ -58,7 +58,12 @@ pub struct WriteFileRequest {
 #[derive(Debug, Deserialize)]
 pub struct CopyFilesRequest {
     pub file_paths: Vec<String>,
+    /// Destination folder inside the owned workspace.
     pub workspace: String,
+    /// Registered workspace root used for authorization when `workspace`
+    /// points at a nested folder.
+    #[serde(default)]
+    pub workspace_root: Option<String>,
     #[serde(default)]
     pub source_root: Option<String>,
 }
@@ -147,7 +152,7 @@ pub struct BrowseDirectoryQuery {
     pub path: Option<String>,
     /// When true, include regular files in the response. Defaults to false
     /// (directories only).
-    #[serde(default)]
+    #[serde(default, alias = "showFiles")]
     pub show_files: Option<String>,
 }
 
@@ -330,6 +335,14 @@ mod tests {
     use serde_json::json;
 
     // -- Request deserialization tests --
+
+    #[test]
+    fn browse_directory_query_accepts_webui_camel_case_show_files() {
+        let req: BrowseDirectoryQuery =
+            serde_json::from_value(json!({ "path": "D:\\docs", "showFiles": "true" })).unwrap();
+        assert_eq!(req.path.as_deref(), Some("D:\\docs"));
+        assert_eq!(req.show_files.as_deref(), Some("true"));
+    }
 
     #[test]
     fn get_files_by_dir_request_deserialization() {

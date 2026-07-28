@@ -427,12 +427,30 @@ async fn copy_files(
     body: Result<Json<CopyFilesRequest>, JsonRejection>,
 ) -> Result<Json<ApiResponse<CopyFilesResponse>>, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    require_owned_workspace(&state, &user, &req.workspace).await?;
-    let source_workspace = req.source_root.as_deref().unwrap_or(&req.workspace);
-    require_owned_workspace(&state, &user, source_workspace).await?;
+    let workspace_root = req.workspace_root.as_deref().unwrap_or(&req.workspace);
+    require_owned_workspace(&state, &user, workspace_root).await?;
+    require_path_inside_workspace(&req.workspace, workspace_root)?;
     if !state.local_mode {
-        for path in &req.file_paths {
-            require_path_inside_workspace(path, source_workspace)?;
+        if let Some(source_workspace) = req.source_root.as_deref() {
+            require_owned_workspace(&state, &user, source_workspace).await?;
+            for path in &req.file_paths {
+                require_path_inside_workspace(path, source_workspace)?;
+            }
+        } else {
+            let browse_roots = state.browse_roots.get();
+            for path in &req.file_paths {
+                let candidate = std::fs::canonicalize(path)
+                    .map_err(|_| ApiError::Forbidden("Selected source file is not accessible".to_owned()))?;
+                if !browse_roots
+                    .iter()
+                    .filter_map(|root| std::fs::canonicalize(root).ok())
+                    .any(|root| candidate.starts_with(root))
+                {
+                    return Err(ApiError::Forbidden(
+                        "Selected source file is outside the browsable roots".to_owned(),
+                    ));
+                }
+            }
         }
     }
     let result = state
@@ -493,7 +511,10 @@ struct UploadMultipartFields {
     file_data: Vec<u8>,
     file_name: Option<String>,
     dispo_file_name: Option<String>,
+    relative_path: Option<String>,
     conversation_id: Option<String>,
+    workspace_root: Option<String>,
+    target_folder: Option<String>,
 }
 
 /// Strip any directory component from a file name and reject empty results.
@@ -509,11 +530,106 @@ fn sanitize_upload_filename(raw: &str) -> Option<String> {
     if last.is_empty() { None } else { Some(last.to_owned()) }
 }
 
+/// Validate a browser-provided path relative to the selected upload folder.
+///
+/// Browsers use forward slashes for `webkitRelativePath`, including on
+/// Windows. Reject every absolute/traversal form instead of normalizing it so
+/// a WebUI client can never use folder upload to escape its owned workspace.
+fn sanitize_upload_relative_path(raw: &str) -> Option<PathBuf> {
+    let normalized = raw.trim().replace('\\', "/");
+    if normalized.is_empty()
+        || normalized.starts_with('/')
+        || normalized.ends_with('/')
+        || normalized.contains('\0')
+        || normalized.as_bytes().get(1) == Some(&b':')
+    {
+        return None;
+    }
+
+    let path = Path::new(&normalized);
+    if path.is_absolute() {
+        return None;
+    }
+
+    let mut safe = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::Normal(value) => safe.push(value),
+            _ => return None,
+        }
+    }
+
+    if safe.file_name().is_none() { None } else { Some(safe) }
+}
+
+/// Create a relative upload directory while checking every resolved component.
+///
+/// The per-component canonicalization is intentional: a pre-existing symlink
+/// or Windows junction must not redirect directory creation outside the owned
+/// workspace.
+fn ensure_upload_directory(workspace_root: &Path, target_folder: &Path, relative: &Path) -> Result<PathBuf, ApiError> {
+    let workspace_root = std::fs::canonicalize(workspace_root)
+        .map_err(|error| ApiError::Internal(format!("failed to resolve workspace root: {error}")))?;
+    let mut current = std::fs::canonicalize(target_folder)
+        .map_err(|error| ApiError::BadRequest(format!("failed to resolve upload target: {error}")))?;
+
+    if !current.starts_with(&workspace_root) {
+        return Err(ApiError::Forbidden(
+            "upload target is outside the owned workspace".to_owned(),
+        ));
+    }
+
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            return Err(ApiError::BadRequest("invalid relative upload path".to_owned()));
+        };
+        let next = current.join(name);
+        match std::fs::symlink_metadata(&next) {
+            Ok(metadata) => {
+                if !metadata.is_dir() && !metadata.file_type().is_symlink() {
+                    return Err(ApiError::BadRequest(format!(
+                        "upload directory component is not a directory: {}",
+                        next.display()
+                    )));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                if let Err(error) = std::fs::create_dir(&next)
+                    && error.kind() != std::io::ErrorKind::AlreadyExists
+                {
+                    return Err(ApiError::Internal(format!(
+                        "failed to create upload directory: {error}"
+                    )));
+                }
+            }
+            Err(error) => {
+                return Err(ApiError::Internal(format!(
+                    "failed to inspect upload directory: {error}"
+                )));
+            }
+        }
+
+        let resolved = std::fs::canonicalize(&next)
+            .map_err(|error| ApiError::Internal(format!("failed to resolve upload directory: {error}")))?;
+        if !resolved.starts_with(&workspace_root) {
+            return Err(ApiError::Forbidden(
+                "relative upload path escapes the owned workspace".to_owned(),
+            ));
+        }
+        current = resolved;
+    }
+
+    Ok(current)
+}
+
 async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMultipartFields, ApiError> {
     let mut file_data: Option<Vec<u8>> = None;
     let mut file_name: Option<String> = None;
     let mut dispo_file_name: Option<String> = None;
+    let mut relative_path: Option<String> = None;
     let mut conversation_id: Option<String> = None;
+    let mut workspace_root: Option<String> = None;
+    let mut target_folder: Option<String> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -544,6 +660,16 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
                     file_name = Some(name);
                 }
             }
+            "relative_path" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read relative_path: {e}")))?;
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    relative_path = Some(trimmed.to_owned());
+                }
+            }
             "conversation_id" => {
                 let text = field
                     .text()
@@ -552,6 +678,26 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
                 let trimmed = text.trim();
                 if !trimmed.is_empty() {
                     conversation_id = Some(trimmed.to_owned());
+                }
+            }
+            "workspace_root" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read workspace_root: {e}")))?;
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    workspace_root = Some(trimmed.to_owned());
+                }
+            }
+            "target_folder" => {
+                let text = field
+                    .text()
+                    .await
+                    .map_err(|e| ApiError::BadRequest(format!("failed to read target_folder: {e}")))?;
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    target_folder = Some(trimmed.to_owned());
                 }
             }
             _ => {}
@@ -564,7 +710,10 @@ async fn extract_upload_multipart(mut multipart: Multipart) -> Result<UploadMult
         file_data,
         file_name,
         dispo_file_name,
+        relative_path,
         conversation_id,
+        workspace_root,
+        target_folder,
     })
 }
 
@@ -575,10 +724,10 @@ async fn upload_file(
 ) -> Result<Json<ApiResponse<String>>, ApiError> {
     let fields = extract_upload_multipart(multipart).await?;
 
-    let file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
+    let fallback_file_name = fields.file_name.or(fields.dispo_file_name).ok_or_else(|| {
         ApiError::BadRequest("missing file name: provide 'file_name' or a multipart filename".to_owned())
     })?;
-    if !state.local_mode {
+    if !state.local_mode && fields.workspace_root.is_none() {
         let conversation_id = fields
             .conversation_id
             .as_deref()
@@ -586,10 +735,62 @@ async fn upload_file(
         require_owned_conversation(&state, &user, conversation_id).await?;
     }
 
-    let path = state
-        .file_service
-        .create_upload_file(&file_name, &fields.file_data, fields.conversation_id.as_deref())
-        .await?;
+    let path = if let Some(workspace_root) = fields.workspace_root.as_deref() {
+        require_owned_workspace(&state, &user, workspace_root).await?;
+        let target_folder = fields.target_folder.as_deref().unwrap_or(workspace_root);
+        require_path_inside_workspace(target_folder, workspace_root)?;
+        let relative_path = fields
+            .relative_path
+            .as_deref()
+            .map(|value| {
+                sanitize_upload_relative_path(value)
+                    .ok_or_else(|| ApiError::BadRequest("invalid relative upload path".to_owned()))
+            })
+            .transpose()?;
+        let file_name = relative_path
+            .as_ref()
+            .and_then(|path| path.file_name())
+            .and_then(|value| value.to_str())
+            .and_then(sanitize_upload_filename)
+            .unwrap_or_else(|| fallback_file_name.clone());
+        let relative_parent = relative_path
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or_else(|| Path::new(""));
+        let target_folder_path =
+            ensure_upload_directory(Path::new(workspace_root), Path::new(target_folder), relative_parent)?;
+        let original = Path::new(&file_name);
+        let stem = original
+            .file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or(&file_name);
+        let extension = original.extension().and_then(|value| value.to_str());
+        let mut destination = target_folder_path.join(&file_name);
+        let mut suffix = 1_u32;
+        while destination.exists() {
+            let candidate_name = match extension {
+                Some(extension) => format!("{stem} ({suffix}).{extension}"),
+                None => format!("{stem} ({suffix})"),
+            };
+            destination = target_folder_path.join(candidate_name);
+            suffix += 1;
+        }
+        let destination = destination.to_string_lossy().into_owned();
+        state
+            .file_service
+            .write_file(&destination, &fields.file_data, workspace_root)
+            .await?;
+        destination
+    } else {
+        state
+            .file_service
+            .create_upload_file(
+                &fallback_file_name,
+                &fields.file_data,
+                fields.conversation_id.as_deref(),
+            )
+            .await?
+    };
     Ok(Json(ApiResponse::ok(path)))
 }
 
@@ -1235,5 +1436,31 @@ mod tests {
     #[test]
     fn sanitize_upload_filename_plain_passthrough() {
         assert_eq!(sanitize_upload_filename("image.png").as_deref(), Some("image.png"));
+    }
+
+    #[test]
+    fn sanitize_upload_relative_path_preserves_safe_tree() {
+        assert_eq!(
+            sanitize_upload_relative_path("reports/2026/budget.xlsx"),
+            Some(PathBuf::from("reports").join("2026").join("budget.xlsx"))
+        );
+        assert_eq!(
+            sanitize_upload_relative_path(r"reports\2026\budget.xlsx"),
+            Some(PathBuf::from("reports").join("2026").join("budget.xlsx"))
+        );
+    }
+
+    #[test]
+    fn sanitize_upload_relative_path_rejects_escape_and_absolute_paths() {
+        for value in [
+            "../secret.txt",
+            "reports/../../secret.txt",
+            "/etc/passwd",
+            r"C:\Windows\win.ini",
+            "reports/",
+            "",
+        ] {
+            assert_eq!(sanitize_upload_relative_path(value), None, "{value}");
+        }
     }
 }
