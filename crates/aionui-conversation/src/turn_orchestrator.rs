@@ -197,7 +197,7 @@ impl ConversationTurnOrchestrator {
         while let Some((current_send, msg_id)) = pending_send.take() {
             let lifecycle = runtime_state.lifecycle_for(&input.conv_id);
             let defer_clean_terminal_errors = input.defer_clean_terminal_errors
-                && agent.agent_type() == AgentType::Acp
+                && matches!(agent.agent_type(), AgentType::Acp | AgentType::Aionrs)
                 && lifecycle == RuntimeLifecycleState::Active
                 && aggregate_summary.safe_to_auto_replay();
             let relay = StreamRelay::new(

@@ -37,7 +37,7 @@ impl TurnRecoveryPolicy {
         let session_recovery_signal = classify_session_recovery_signal(outcome);
 
         let decision = if lifecycle == RuntimeLifecycleState::Active
-            && agent_type == AgentType::Acp
+            && matches!(agent_type, AgentType::Acp | AgentType::Aionrs)
             && outcome.terminal.is_error()
             && retryable == Some(true)
             && error_code != Some(AgentErrorCode::UserLlmProviderModelNotFound)
@@ -297,12 +297,19 @@ mod tests {
     }
 
     #[test]
-    fn non_acp_agent_does_not_auto_replay() {
+    fn retryable_clean_aionrs_error_auto_replays_once() {
         let outcome = retryable_clean_error();
 
         let decision =
             TurnRecoveryPolicy::decide(AgentType::Aionrs, None, &outcome, RuntimeLifecycleState::Active, false);
 
-        assert_eq!(decision, TurnRecoveryDecision::None);
+        assert_eq!(
+            decision,
+            TurnRecoveryDecision::AutoReplayOnce {
+                reason: AgentKillReason::AgentErrorRecovery,
+                safe_to_auto_replay: true,
+                session_recovery_signal: None,
+            }
+        );
     }
 }
