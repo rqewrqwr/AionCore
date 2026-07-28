@@ -1215,8 +1215,13 @@ impl AssistantService {
                     last_mcp_ids = mcps.value.clone();
                 }
                 "auto" => {
-                    if previous_definition.is_some_and(|current| current.default_mcps_mode == "fixed") {
-                        last_mcp_ids.clear();
+                    if !mcps.value.is_empty() {
+                        last_mcp_ids = mcps.value.clone();
+                    } else if let Some(current) =
+                        previous_definition.filter(|current| current.default_mcps_mode == "fixed")
+                    {
+                        last_mcp_ids =
+                            decode_str_list(Some(current.default_mcp_ids.as_str()))?;
                     }
                 }
                 other => {
@@ -5274,7 +5279,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_switching_defaults_from_fixed_to_auto_clears_preferences() {
+    async fn update_switching_defaults_from_fixed_to_auto_preserves_last_mcps() {
         let fx = fixture().await;
         fx.service
             .create(CreateAssistantRequest {
@@ -5334,7 +5339,11 @@ mod tests {
             .unwrap();
 
         let definition = fx.definition_repo.get_by_assistant_id("u1").await.unwrap().unwrap();
-        assert!(fx.preference_repo.get(&definition.id).await.unwrap().is_none());
+        let pref = fx.preference_repo.get(&definition.id).await.unwrap().unwrap();
+        assert_eq!(pref.last_model_id, None);
+        assert_eq!(pref.last_permission_value, None);
+        assert_eq!(pref.last_skill_ids, "[]");
+        assert_eq!(pref.last_mcp_ids, r#"["mcp-z"]"#);
     }
 
     #[tokio::test]
