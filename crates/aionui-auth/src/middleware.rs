@@ -122,7 +122,9 @@ fn authorize_scoped_runtime_token(
     ]
     .into_iter()
     .any(|root| route_is_or_has_child(path, root));
+    let conversation_cron_route = is_conversation_cron_runtime_route(method, path);
     let allowed = (method == "GET" && path == conversation_path)
+        || conversation_cron_route
         || (private_asset_route && private_asset_gateway_is_trusted(request, private_asset_gateway_secret));
     if !allowed {
         return Err(ApiError::Forbidden(
@@ -159,6 +161,16 @@ fn constant_time_eq(expected: &[u8], actual: &[u8]) -> bool {
 
 fn route_is_or_has_child(path: &str, root: &str) -> bool {
     path == root || path.strip_prefix(root).is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_conversation_cron_runtime_route(method: &str, path: &str) -> bool {
+    match (method, path) {
+        ("GET", "/api/internal/conversation-cron/list") | ("POST", "/api/internal/conversation-cron/create") => true,
+        ("PUT", path) => path
+            .strip_prefix("/api/internal/conversation-cron/jobs/")
+            .is_some_and(|job_id| !job_id.is_empty() && !job_id.contains('/')),
+        _ => false,
+    }
 }
 
 /// Local-mode authentication middleware that skips JWT verification.
@@ -264,5 +276,85 @@ mod tests {
             .unwrap();
 
         assert!(authorize_scoped_runtime_token(&payload, &request, Some("gateway-secret")).is_err());
+    }
+
+    #[test]
+    fn scoped_runtime_token_allows_only_conversation_cron_current_routes_for_its_context() {
+        let payload = TokenPayload {
+            user_id: "user-1".into(),
+            username: String::new(),
+            iat: 1,
+            exp: u64::MAX,
+            iss: "aionui".into(),
+            aud: "aionui-webui".into(),
+            scope: Some(AGENT_SKILL_CONFIG_SCOPE.into()),
+            conversation_id: Some("conv-1".into()),
+        };
+        let request = |method: &str, path: &str, user_id: &str, conversation_id: &str| {
+            Request::builder()
+                .method(method)
+                .uri(path)
+                .header("x-aionui-user-id", user_id)
+                .header("x-aionui-conversation-id", conversation_id)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        for (method, path) in [
+            ("GET", "/api/internal/conversation-cron/list"),
+            ("POST", "/api/internal/conversation-cron/create"),
+            ("PUT", "/api/internal/conversation-cron/jobs/cron-1"),
+        ] {
+            assert!(
+                authorize_scoped_runtime_token(
+                    &payload,
+                    &request(method, path, "user-1", "conv-1"),
+                    Some("gateway-secret")
+                )
+                .is_ok(),
+                "{method} {path} should be allowed"
+            );
+        }
+
+        for (method, path) in [
+            ("POST", "/api/internal/conversation-cron/list"),
+            ("GET", "/api/internal/conversation-cron/create"),
+            ("GET", "/api/internal/conversation-cron/jobs/cron-1"),
+            ("PUT", "/api/internal/conversation-cron/jobs/"),
+            ("PUT", "/api/internal/conversation-cron/jobs/cron-1/run"),
+            ("GET", "/api/cron/jobs"),
+        ] {
+            assert!(
+                authorize_scoped_runtime_token(
+                    &payload,
+                    &request(method, path, "user-1", "conv-1"),
+                    Some("gateway-secret")
+                )
+                .is_err(),
+                "{method} {path} should be rejected"
+            );
+        }
+
+        assert!(
+            authorize_scoped_runtime_token(
+                &payload,
+                &request("GET", "/api/internal/conversation-cron/list", "other-user", "conv-1"),
+                Some("gateway-secret")
+            )
+            .is_err()
+        );
+        assert!(
+            authorize_scoped_runtime_token(
+                &payload,
+                &request(
+                    "GET",
+                    "/api/internal/conversation-cron/list",
+                    "user-1",
+                    "other-conversation"
+                ),
+                Some("gateway-secret")
+            )
+            .is_err()
+        );
     }
 }
