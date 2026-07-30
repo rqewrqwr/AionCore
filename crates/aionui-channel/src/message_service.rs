@@ -74,6 +74,7 @@ impl ChannelMessageService {
             content: text.to_owned(),
             files: vec![],
             inject_skills: vec![],
+            knowledge_context: None,
             hidden: false,
         };
 

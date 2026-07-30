@@ -97,6 +97,10 @@ pub struct SendMessageRequest {
     pub files: Vec<String>,
     #[serde(default)]
     pub inject_skills: Vec<String>,
+    /// Query-specific evidence retrieved from knowledge bases bound to the assistant.
+    /// This is sent to the model but is not persisted as part of the visible user message.
+    #[serde(default)]
+    pub knowledge_context: Option<String>,
     #[serde(default)]
     pub hidden: bool,
 }
@@ -812,12 +816,17 @@ mod tests {
             "content": "Review this code",
             "files": ["/tmp/a.rs"],
             "inject_skills": ["security-review"],
+            "knowledge_context": "Refunds are available within 30 days.",
             "hidden": true
         });
         let req: SendMessageRequest = serde_json::from_value(raw).unwrap();
         assert_eq!(req.content, "Review this code");
         assert_eq!(req.files, vec!["/tmp/a.rs"]);
         assert_eq!(req.inject_skills, vec!["security-review"]);
+        assert_eq!(
+            req.knowledge_context.as_deref(),
+            Some("Refunds are available within 30 days.")
+        );
         assert!(req.hidden);
     }
 
@@ -828,6 +837,7 @@ mod tests {
         assert_eq!(req.content, "Hi");
         assert!(req.files.is_empty());
         assert!(req.inject_skills.is_empty());
+        assert!(req.knowledge_context.is_none());
         assert!(!req.hidden);
     }
 

@@ -3045,6 +3045,7 @@ impl ConversationService {
                     content: request.content,
                     files: request.files,
                     inject_skills: request.inject_skills,
+                    knowledge_context: None,
                     hidden: request.user_message_hidden,
                 },
                 required_runtime_mode: request.required_runtime_mode,
