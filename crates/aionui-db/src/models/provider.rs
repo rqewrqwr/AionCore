@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 /// Row mapping for the `providers` table.
 ///
-/// JSON fields (models, capabilities, model_protocols, model_enabled,
-/// model_health, bedrock_config) are stored as TEXT in SQLite and
+/// JSON fields (models, capabilities, model_protocols, model_capabilities,
+/// model_enabled, model_health, bedrock_config) are stored as TEXT in SQLite and
 /// deserialized by the service layer.
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Provider {
@@ -22,6 +22,8 @@ pub struct Provider {
     pub context_limit: Option<i64>,
     /// JSON object: model_id -> protocol string.
     pub model_protocols: Option<String>,
+    /// JSON object: model_id -> capability array.
+    pub model_capabilities: Option<String>,
     /// JSON object: model_id -> bool.
     pub model_enabled: Option<String>,
     /// JSON object: model_id -> health status object.

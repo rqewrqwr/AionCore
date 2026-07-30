@@ -68,6 +68,7 @@ async fn create_provider(db: &aionui_db::Database, platform: &str, base_url: &st
             capabilities: "[]",
             context_limit: None,
             model_protocols: None,
+            model_capabilities: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,

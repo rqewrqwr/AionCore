@@ -1,0 +1,2 @@
+ALTER TABLE providers
+ADD COLUMN model_capabilities TEXT;

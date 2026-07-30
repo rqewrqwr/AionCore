@@ -70,6 +70,7 @@ impl ProviderService {
         let models_json = serialize_json(&req.models, "models")?;
         let capabilities_json = serialize_json(&req.capabilities, "capabilities")?;
         let model_protocols_json = serialize_opt(&req.model_protocols, "model_protocols")?;
+        let model_capabilities_json = serialize_opt(&req.model_capabilities, "model_capabilities")?;
         let model_enabled_json = serialize_opt(&req.model_enabled, "model_enabled")?;
         let model_health_json = serialize_opt(&req.model_health, "model_health")?;
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
@@ -86,6 +87,7 @@ impl ProviderService {
             capabilities: &capabilities_json,
             context_limit: req.context_limit,
             model_protocols: model_protocols_json.as_deref(),
+            model_capabilities: model_capabilities_json.as_deref(),
             model_enabled: model_enabled_json.as_deref(),
             model_health: model_health_json.as_deref(),
             bedrock_config: bedrock_json.as_deref(),
@@ -117,6 +119,7 @@ impl ProviderService {
         let models_json = serialize_opt(&req.models, "models")?;
         let capabilities_json = serialize_opt(&req.capabilities, "capabilities")?;
         let model_protocols_json = serialize_opt(&req.model_protocols, "model_protocols")?;
+        let model_capabilities_json = serialize_opt(&req.model_capabilities, "model_capabilities")?;
         let model_enabled_json = serialize_opt(&req.model_enabled, "model_enabled")?;
         let model_health_json = serialize_opt(&req.model_health, "model_health")?;
         let bedrock_json = serialize_opt(&req.bedrock_config, "bedrock_config")?;
@@ -131,6 +134,7 @@ impl ProviderService {
             capabilities: capabilities_json.as_deref(),
             context_limit: req.context_limit.map(Some),
             model_protocols: model_protocols_json.as_ref().map(|s| Some(s.as_str())),
+            model_capabilities: model_capabilities_json.as_ref().map(|s| Some(s.as_str())),
             model_enabled: model_enabled_json.as_ref().map(|s| Some(s.as_str())),
             model_health: model_health_json.as_ref().map(|s| Some(s.as_str())),
             bedrock_config: bedrock_json.as_ref().map(|s| Some(s.as_str())),
@@ -178,6 +182,7 @@ impl ProviderService {
             .map_err(|e| SystemError::Internal(format!("Failed to parse capabilities JSON: {e}")))?;
         let model_protocols: Option<HashMap<String, String>> =
             deserialize_opt(&row.model_protocols, "model_protocols")?;
+        let model_capabilities = deserialize_opt(&row.model_capabilities, "model_capabilities")?;
         let model_enabled: Option<HashMap<String, bool>> = deserialize_opt(&row.model_enabled, "model_enabled")?;
         let model_health = deserialize_opt(&row.model_health, "model_health")?;
         let bedrock_config = deserialize_opt(&row.bedrock_config, "bedrock_config")?;
@@ -193,6 +198,7 @@ impl ProviderService {
             capabilities,
             context_limit: row.context_limit,
             model_protocols,
+            model_capabilities,
             model_enabled,
             model_health,
             bedrock_config,
@@ -360,6 +366,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_capabilities: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,
@@ -608,6 +615,13 @@ mod tests {
         use std::collections::HashMap;
         let svc = setup().await;
         let req = CreateProviderRequest {
+            model_capabilities: Some(HashMap::from([(
+                "text-embedding-3-large".into(),
+                vec![aionui_api_types::ModelCapability {
+                    capability_type: aionui_api_types::ModelType::Embedding,
+                    is_user_selected: Some(true),
+                }],
+            )])),
             model_protocols: Some(HashMap::from([("gpt-4".into(), "openai".into())])),
             model_enabled: Some(HashMap::from([("gpt-4".into(), true), ("gpt-3.5".into(), false)])),
             ..sample_create_request()
@@ -618,6 +632,15 @@ mod tests {
             created.model_protocols.as_ref().and_then(|m| m.get("gpt-4")),
             Some(&"openai".to_string())
         );
+        assert_eq!(
+            created
+                .model_capabilities
+                .as_ref()
+                .and_then(|models| models.get("text-embedding-3-large"))
+                .and_then(|capabilities| capabilities.first())
+                .map(|capability| capability.capability_type),
+            Some(aionui_api_types::ModelType::Embedding)
+        );
         assert_eq!(created.model_enabled.as_ref().and_then(|m| m.get("gpt-4")), Some(&true));
         assert_eq!(
             created.model_enabled.as_ref().and_then(|m| m.get("gpt-3.5")),
@@ -626,6 +649,15 @@ mod tests {
 
         // And persist through a fresh read.
         let all = svc.list().await.unwrap();
+        assert_eq!(
+            all[0]
+                .model_capabilities
+                .as_ref()
+                .and_then(|models| models.get("text-embedding-3-large"))
+                .and_then(|capabilities| capabilities.first())
+                .map(|capability| capability.capability_type),
+            Some(aionui_api_types::ModelType::Embedding)
+        );
         assert_eq!(all[0].model_enabled.as_ref().and_then(|m| m.get("gpt-4")), Some(&true));
     }
 

@@ -26,6 +26,7 @@ fn sample_params() -> CreateProviderParams<'static> {
         capabilities: r#"[{"type":"text"}]"#,
         context_limit: Some(200000),
         model_protocols: None,
+        model_capabilities: None,
         model_enabled: None,
         model_health: None,
         bedrock_config: None,
@@ -72,6 +73,7 @@ async fn create_with_all_optional_fields() {
     let p = r
         .create(CreateProviderParams {
             model_protocols: Some(r#"{"m1":"openai"}"#),
+            model_capabilities: Some(r#"{"m1":[{"type":"embedding"}]}"#),
             model_enabled: Some(r#"{"m1":true}"#),
             model_health: Some(r#"{"m1":{"status":"healthy"}}"#),
             bedrock_config: Some(r#"{"region":"us-east-1"}"#),
@@ -81,6 +83,10 @@ async fn create_with_all_optional_fields() {
         .unwrap();
 
     assert_eq!(p.model_protocols.as_deref(), Some(r#"{"m1":"openai"}"#));
+    assert_eq!(
+        p.model_capabilities.as_deref(),
+        Some(r#"{"m1":[{"type":"embedding"}]}"#)
+    );
     assert_eq!(p.model_enabled.as_deref(), Some(r#"{"m1":true}"#));
     assert!(p.model_health.is_some());
     assert!(p.bedrock_config.is_some());

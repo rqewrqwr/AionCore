@@ -136,6 +136,8 @@ pub struct ProviderResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_protocols: Option<HashMap<String, String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_capabilities: Option<HashMap<String, Vec<ModelCapability>>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
@@ -171,6 +173,8 @@ pub struct CreateProviderRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_protocols: Option<HashMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_capabilities: Option<HashMap<String, Vec<ModelCapability>>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_enabled: Option<HashMap<String, bool>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
@@ -198,6 +202,7 @@ pub struct UpdateProviderRequest {
     pub capabilities: Option<Vec<ModelCapability>>,
     pub context_limit: Option<i64>,
     pub model_protocols: Option<HashMap<String, String>>,
+    pub model_capabilities: Option<HashMap<String, Vec<ModelCapability>>>,
     pub model_enabled: Option<HashMap<String, bool>>,
     pub model_health: Option<HashMap<String, ModelHealthStatus>>,
     pub bedrock_config: Option<BedrockConfig>,
@@ -468,6 +473,7 @@ mod tests {
             }],
             context_limit: None,
             model_protocols: None,
+            model_capabilities: None,
             model_enabled: Some(HashMap::from([("claude-sonnet-4-20250514".into(), true)])),
             model_health: None,
             bedrock_config: None,
@@ -501,6 +507,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_capabilities: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,
@@ -590,6 +597,10 @@ mod tests {
             "base_url": "https://api.openai.com",
             "api_key": "sk-test",
             "models": ["gpt-4", "gpt-3.5"],
+            "model_capabilities": {
+                "gpt-4": [{"type": "text", "is_user_selected": true}],
+                "text-embedding-3-large": [{"type": "embedding", "is_user_selected": true}]
+            },
             "model_protocols": {"gpt-4": "openai"},
             "model_enabled": {"gpt-4": true, "gpt-3.5": false},
             "model_health": {
@@ -600,6 +611,14 @@ mod tests {
         assert_eq!(
             req.model_protocols.as_ref().unwrap().get("gpt-4"),
             Some(&"openai".to_string())
+        );
+        assert_eq!(
+            req.model_capabilities
+                .as_ref()
+                .and_then(|capabilities| capabilities.get("text-embedding-3-large"))
+                .and_then(|capabilities| capabilities.first())
+                .map(|capability| capability.capability_type),
+            Some(ModelType::Embedding)
         );
         assert_eq!(req.model_enabled.as_ref().unwrap().get("gpt-4"), Some(&true));
         assert_eq!(req.model_enabled.as_ref().unwrap().get("gpt-3.5"), Some(&false));
@@ -622,6 +641,7 @@ mod tests {
             capabilities: vec![],
             context_limit: None,
             model_protocols: None,
+            model_capabilities: None,
             model_enabled: None,
             model_health: None,
             bedrock_config: None,
